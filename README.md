@@ -36,7 +36,7 @@
 **1. Системные зависимости:**
 
 ```bash
-sudo pacman -S python python-pip portaudio ydotool wtype wl-clipboard espeak-ng
+sudo pacman -S python python-pip portaudio ydotool wtype wl-clipboard festival
 ```
 
 **2. Python-зависимости:**
@@ -44,7 +44,7 @@ sudo pacman -S python python-pip portaudio ydotool wtype wl-clipboard espeak-ng
 ```bash
 python -m venv ~/antigravity-env
 source ~/antigravity-env/bin/activate.fish
-pip install vosk sounddevice pyttsx3 pyperclip
+pip install vosk sounddevice
 ```
 
 **3. Модель Vosk (русский язык):**

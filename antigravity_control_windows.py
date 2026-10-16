@@ -49,9 +49,16 @@ class CustomFormatter(logging.Formatter):
         logging.CRITICAL: "\033[1;91m🚨 %(message)s\033[0m",
     }
 
+    def __init__(self):
+        super().__init__()
+        self._formatters = {
+            level: logging.Formatter(fmt, datefmt="%H:%M:%S")
+            for level, fmt in self.FORMATS.items()
+        }
+        self._default_formatter = logging.Formatter("%(message)s")
+
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno, "%(message)s")
-        formatter = logging.Formatter(log_fmt, datefmt="%H:%M:%S")
+        formatter = self._formatters.get(record.levelno, self._default_formatter)
         return formatter.format(record)
 
 logger = logging.getLogger("AntigravityVoiceWin")
@@ -200,7 +207,8 @@ FILLER_WORDS = {
     "кнопка", "кнопки", "кнопку",
     "цифра", "цифру", "цифры",
     "буква", "букву", "буквы",
-    "и", "затем", "потом", "далее", "пожалуйста"
+    "и", "затем", "потом", "далее", "пожалуйста",
+    "на", "мне", "же"
 }
 
 # ---------------------------------------------------------------------------
@@ -223,7 +231,15 @@ class VoiceSynthesizer:
             self._thread.start()
 
     def _worker(self):
-        """Рабочий поток SAPI5 TTS."""
+        """Рабочий поток SAPI5 TTS с корректной инициализацией COM."""
+        # На Windows в отдельных потоках требуется явная инициализация COM
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.ole32.CoInitialize(None)
+            except Exception as e:
+                logger.debug(f"CoInitialize warning: {e}")
+
         try:
             import pyttsx3
             # Инициализация SAPI5 внутри рабочего потока
@@ -248,17 +264,25 @@ class VoiceSynthesizer:
             logger.warning(f"Ошибка инициализации pyttsx3 SAPI5: {e}. TTS отключён.")
             self._engine = None
 
-        while True:
-            text = self._queue.get()
-            if text is None:
-                break
-            if self._engine and text:
+        try:
+            while True:
+                text = self._queue.get()
+                if text is None:
+                    break
+                if self._engine and text:
+                    try:
+                        self._engine.say(text)
+                        self._engine.runAndWait()
+                    except Exception as e:
+                        logger.debug(f"Ошибка воспроизведения речи: {e}")
+                self._queue.task_done()
+        finally:
+            if sys.platform == "win32":
                 try:
-                    self._engine.say(text)
-                    self._engine.runAndWait()
-                except Exception as e:
-                    logger.debug(f"Ошибка воспроизведения речи: {e}")
-            self._queue.task_done()
+                    import ctypes
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
 
     def speak(self, text: str) -> None:
         """Помещает фразу в очередь озвучивания (не блокирует вызов)."""
@@ -269,6 +293,7 @@ class VoiceSynthesizer:
         """Останавливает рабочий поток TTS."""
         if self.enabled and self._thread.is_alive():
             self._queue.put(None)
+            self._thread.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +307,23 @@ class AntigravityController:
 
     def _check_modules(self) -> None:
         """Проверяет наличие необходимых Windows-библиотек."""
-        for mod in ["keyboard", "pyperclip", "pygetwindow"]:
+        missing = []
+        for mod in ["keyboard", "pyperclip"]:
             try:
                 __import__(mod)
             except ImportError:
-                logger.critical(f"Модуль '{mod}' не установлен! Выполните: pip install {mod}")
+                missing.append(mod)
+
+        if missing:
+            logger.critical(f"Не установлены обязательные модули: {', '.join(missing)}!")
+            logger.critical(f"Выполните: pip install {' '.join(missing)}")
+            sys.exit(1)
+
+        try:
+            __import__("pygetwindow")
+        except ImportError:
+            logger.warning("Модуль 'pygetwindow' не установлен (будет использоваться win32gui fallback).")
+            logger.warning("Для лучшей работы установите: pip install pygetwindow pywin32")
 
     def activate_antigravity_window(self) -> bool:
         """
@@ -325,7 +362,10 @@ class AntigravityController:
             if matched_hwnds:
                 hwnd = matched_hwnds[0]
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                win32gui.SetForegroundWindow(hwnd)
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception as e:
+                    logger.debug(f"SetForegroundWindow warning: {e}")
                 logger.debug("Фокус переключён на окно Antigravity (win32gui)")
                 return True
         except ImportError:
@@ -505,22 +545,17 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
     if clean in ["справка", "помощь", "команды", "help"]:
         return ("HELP",)
 
-    # 3. Вставка из буфера с отправкой ("вставь и отправь")
-    for pattern in ["вставь и отправь", "вставить и отправить", "вставь и отправить", "вставить и отправь"]:
-        if clean == pattern or clean.startswith(pattern):
+    # 3. Вставка из буфера (с отправкой или без)
+    if any(clean.startswith(p) for p in ["вставь", "вставить", "вставка"]):
+        if any(s in clean for s in ["отправ", "пошли", "запусти", "выполни"]):
             return ("PASTE_AND_SEND",)
+        return ("PASTE",)
 
-    # 4. Вставка из буфера без отправки ("вставь")
-    for pattern in ["вставь", "вставить", "вставка"]:
-        if clean == pattern or clean.startswith(pattern):
-            return ("PASTE",)
+    # 4. Просто отправка ("отправь")
+    if any(clean == p or clean.startswith(p + " ") for p in ["отправь", "отправить", "выполни", "выполнить", "пошли", "послать"]):
+        return ("SEND",)
 
-    # 5. Просто отправка ("отправь")
-    for pattern in ["отправь", "отправить", "выполни", "выполнить", "пошли", "послать"]:
-        if clean == pattern:
-            return ("SEND",)
-
-    # 6. Ввод текста: "напиши [текст]" или "напиши [текст] и отправь"
+    # 5. Ввод текста: "напиши [текст]" или "напиши [текст] и отправь"
     TYPE_TRIGGERS = [
         "напиши ", "напишите ", "на пиши ", "на пишите ",
         "напечатай ", "напечатайте ", "на печатай ",
@@ -537,10 +572,11 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
     for prefix in TYPE_TRIGGERS:
         if prefix in clean:
             idx = clean.find(prefix)
-            body = clean[idx + len(prefix):].strip()
-            body = body.lstrip(" ,:;-")
+            body = clean[idx + len(prefix):].strip().lstrip(" ,:;-")
             if not body:
                 continue
+            if body.startswith("пожалуйста "):
+                body = body[len("пожалуйста "):].strip()
             send = False
             for suffix in SEND_SUFFIXES:
                 if body.endswith(suffix):
@@ -554,7 +590,7 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
                     return ("TYPE", body)
             break
 
-    # 7. Нажатие клавиш с префиксом ("нажми три", "нажми один два три")
+    # 6. Нажатие клавиш с префиксом ("нажми три", "нажми один два три")
     for prefix in ["нажми ", "нажать ", "жми ", "кликни ", "нажмите "]:
         if clean.startswith(prefix):
             body = clean[len(prefix):].strip()
@@ -562,19 +598,21 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
             if codes:
                 return ("KEYS", codes, names)
 
-    # 8. Прямой ввод клавиш без префикса (например: "энтер", "стрелка вверх")
+    # 7. Прямой ввод клавиш без префикса (например: "энтер", "стрелка вверх")
     words = clean.split()
     codes, names, consumed = parse_key_tokens(words)
     meaningful_words = [w for w in words if w not in FILLER_WORDS]
     if codes and consumed > 0 and consumed == len(meaningful_words):
         return ("KEYS", codes, names)
 
-    # 9. Запасной разбор, если фраза начинается с глагола действия
-    for verb in ["напиши", "напечатай", "введи", "набери"]:
+    # 8. Запасной разбор, если фраза начинается с глагола действия
+    for verb in ["напиши", "напишите", "напечатай", "напечатайте", "введи", "введите", "набери", "наберите"]:
         if clean.startswith(verb):
             body = clean[len(verb):].strip(" ,:;-")
             if body.startswith("ка ") or body.startswith("-ка "):
                 body = body.split(" ", 1)[-1].strip(" ,:;-")
+            if body.startswith("пожалуйста "):
+                body = body[len("пожалуйста "):].strip()
             if body:
                 for suffix in SEND_SUFFIXES:
                     if body.endswith(suffix):
@@ -588,14 +626,6 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
             codes, names, _ = parse_key_tokens(body.split())
             if codes:
                 return ("KEYS", codes, names)
-
-    if clean.startswith("вставь") or clean.startswith("вставить"):
-        if "отправ" in clean:
-            return ("PASTE_AND_SEND",)
-        return ("PASTE",)
-
-    if clean.startswith("отправь") or clean.startswith("отправить"):
-        return ("SEND",)
 
     return ("UNKNOWN", clean)
 
@@ -643,6 +673,7 @@ def find_default_model_path() -> str:
     """Определяет стандартный путь к модели Vosk в Windows."""
     candidates = [
         r"C:\vosk-models\vosk-model-small-ru-0.22",
+        str(Path.home() / "vosk-models" / "vosk-model-small-ru-0.22"),
         os.path.expanduser(r"~\vosk-models\vosk-model-small-ru-0.22"),
         r"vosk-model-small-ru-0.22",
     ]
@@ -774,10 +805,20 @@ def main():
                 except queue.Empty:
                     continue
 
-                if recognizer.AcceptWaveform(data):
-                    res_json = json.loads(recognizer.Result())
-                    phrase = res_json.get("text", "").strip()
+                try:
+                    accepted = recognizer.AcceptWaveform(data)
+                except Exception as e:
+                    logger.debug(f"Ошибка AcceptWaveform: {e}")
+                    continue
 
+                if accepted:
+                    try:
+                        res_json = json.loads(recognizer.Result())
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.debug(f"Не удалось распарсить JSON Vosk: {e}")
+                        continue
+
+                    phrase = res_json.get("text", "").strip()
                     if not phrase:
                         continue
 

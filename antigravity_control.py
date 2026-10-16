@@ -21,8 +21,8 @@
      - "вставь"                     -> чтение через wl-paste + Ctrl+V
      - "вставь и отправь"           -> вставка + Enter
   3. Ввод текста голосом:
-     - "напиши [текст]"             -> ydotool type
-     - "напиши [текст] и отправь"   -> ydotool type + Enter
+     - "напиши [текст]"             -> wtype / ydotool type
+     - "напиши [текст] и отправь"   -> ввод текста + Enter
   4. Отправка:
      - "отправь"                    -> Enter
   5. Управление приложением:
@@ -59,9 +59,16 @@ class CustomFormatter(logging.Formatter):
         logging.CRITICAL: "\033[1;91m🚨 %(message)s\033[0m",
     }
 
+    def __init__(self):
+        super().__init__()
+        self._formatters = {
+            level: logging.Formatter(fmt, datefmt="%H:%M:%S")
+            for level, fmt in self.FORMATS.items()
+        }
+        self._default_formatter = logging.Formatter("%(message)s")
+
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno, "%(message)s")
-        formatter = logging.Formatter(log_fmt, datefmt="%H:%M:%S")
+        formatter = self._formatters.get(record.levelno, self._default_formatter)
         return formatter.format(record)
 
 logger = logging.getLogger("AntigravityVoice")
@@ -238,7 +245,8 @@ FILLER_WORDS = {
     "кнопка", "кнопки", "кнопку",
     "цифра", "цифру", "цифры",
     "буква", "букву", "буквы",
-    "и", "затем", "потом", "далее", "пожалуйста"
+    "и", "затем", "потом", "далее", "пожалуйста",
+    "на", "мне", "же"
 }
 
 # ---------------------------------------------------------------------------
@@ -262,12 +270,14 @@ class VoiceSynthesizer:
         # Запускаем festival --server
         if not self._start_server():
             logger.warning("Festival сервер не запущен. TTS отключён.")
+            self.stop()
             self.enabled = False
             return
 
         # Загружаем русский голос в сервер
         if not self._load_voice():
             logger.warning("Русский голос не загружен. TTS отключён.")
+            self.stop()
             self.enabled = False
             return
 
@@ -297,6 +307,9 @@ class VoiceSynthesizer:
             )
             # Ждём, пока сервер стартует
             for _ in range(20):
+                if self._server_process.poll() is not None:
+                    logger.error(f"Festival сервер аварийно завершился с кодом {self._server_process.poll()}.")
+                    return False
                 time.sleep(0.2)
                 try:
                     with socket.create_connection(("localhost", self.port), timeout=0.5):
@@ -305,8 +318,8 @@ class VoiceSynthesizer:
                     continue
             logger.warning("Festival сервер не отвечает на порту.")
             return False
-        except FileNotFoundError:
-            logger.error("Festival не найден.")
+        except (FileNotFoundError, OSError) as e:
+            logger.error(f"Не удалось запустить Festival: {e}")
             return False
 
     def _send_scheme(self, scheme_code: str) -> bool:
@@ -336,7 +349,12 @@ class VoiceSynthesizer:
             if text is None:
                 break
             if text:
-                safe_text = text.replace('"', '\\"')
+                safe_text = (
+                    text.replace('\\', '\\\\')
+                    .replace('"', '\\"')
+                    .replace('\n', ' ')
+                    .replace('\r', ' ')
+                )
                 scheme = f'(SayText "{safe_text}")'
                 self._send_scheme(scheme)
             self._queue.task_done()
@@ -348,10 +366,9 @@ class VoiceSynthesizer:
 
     def stop(self) -> None:
         """Останавливает поток синтеза речи и завершает процесс сервера."""
-        if not self.enabled:
-            return
         if self._thread and self._thread.is_alive():
             self._queue.put(None)
+            self._thread.join(timeout=1.0)
         # Завершаем сервер
         if self._server_process:
             try:
@@ -365,13 +382,14 @@ class VoiceSynthesizer:
                     self._server_process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     self._server_process.kill()
+            self._server_process = None
 
 
 # ---------------------------------------------------------------------------
-# 4. Контроллер эмуляции ввода (ydotool) и буфера обмена (wl-clipboard)
+# 4. Контроллер эмуляции ввода (ydotool / wtype) и буфера обмена (wl-clipboard)
 # ---------------------------------------------------------------------------
 class AntigravityController:
-    """Управляет эмуляцией ввода через ydotool и буфером обмена Wayland."""
+    """Управляет эмуляцией ввода через wtype / ydotool и буфером обмена Wayland."""
     def __init__(self, socket_path: str = "/run/ydotoold.socket", tts: Optional[VoiceSynthesizer] = None):
         self.socket_path = socket_path
         self.tts = tts
@@ -382,7 +400,7 @@ class AntigravityController:
         self._check_prerequisites()
 
     def _check_prerequisites(self) -> None:
-        """Проверяет доступность бинарников ydotool, wl-paste и сокета демона."""
+        """Проверяет доступность бинарников ydotool, wtype, wl-paste и сокета демона."""
         # Проверка ydotool
         if not shutil.which("ydotool"):
             logger.critical("Утилита ydotool не найдена в PATH!")
@@ -400,11 +418,18 @@ class AntigravityController:
         if not shutil.which("wl-paste"):
             logger.warning("Утилита wl-paste не найдена. Установите: sudo pacman -S wl-clipboard")
 
+        # Проверка wtype (критично для кириллицы в Wayland)
+        if not shutil.which("wtype"):
+            logger.warning("Утилита wtype не найдена. Для корректного ввода кириллицы установите: sudo pacman -S wtype")
+
     def activate_antigravity_window(self) -> bool:
         """
         Переключает фокус на окно Antigravity через hyprctl (Hyprland).
         Окно определяется по классу: "class:antigravity".
         """
+        if not shutil.which("hyprctl"):
+            return False
+
         try:
             result = subprocess.run(
                 ["hyprctl", "dispatch",
@@ -414,12 +439,23 @@ class AntigravityController:
                 timeout=2.0,
             )
             if "ok" in result.stdout.lower():
-                logger.debug("Фокус переключён на окно Antigravity")
+                logger.debug("Фокус переключён на окно Antigravity (hl.dsp.focus)")
                 return True
-            else:
-                logger.warning(f"Не удалось активировать окно: "
-                               f"{result.stdout.strip()} {result.stderr.strip()}")
-                return False
+
+            # Запасной вариант стандартного диспетчера Hyprland
+            fallback = subprocess.run(
+                ["hyprctl", "dispatch", "focuswindow", "class:antigravity"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if "ok" in fallback.stdout.lower():
+                logger.debug("Фокус переключён на окно Antigravity (focuswindow)")
+                return True
+
+            logger.warning(f"Не удалось активировать окно: "
+                           f"{result.stdout.strip()} {result.stderr.strip()}")
+            return False
         except Exception as e:
             logger.warning(f"Ошибка активации окна: {e}")
             return False
@@ -477,7 +513,7 @@ class AntigravityController:
         logger.info("↵  \033[1mОтправка (Enter)\033[0m")
         self.activate_antigravity_window()
         time.sleep(0.2)
-        success = self._run_ydotool("key", "28:1", "28:0")
+        success = self._run_ydotool("key", f"{KEY_ENTER}:1", f"{KEY_ENTER}:0")
         if success and speak and self.tts:
             self.tts.speak("Отправлено")
 
@@ -502,7 +538,7 @@ class AntigravityController:
 
     def paste_from_clipboard(self, and_send: bool = False) -> None:
         """
-        Вставляет содержимое буфера обмена в активное окно Antigravity.
+        Вставляет содержимое буфера обмена в активное окно Antigravity 2.0 (Ctrl+V).
         Использует wtype (Wayland-native), если доступен, иначе fallback на ydotool.
         """
         content = self.read_clipboard()
@@ -520,49 +556,44 @@ class AntigravityController:
         self.activate_antigravity_window()
         time.sleep(0.3)
 
-        # Способ 1: wtype (Wayland-native, надёжнее в Hyprland)
         success = False
+        # Способ 1: wtype Ctrl+V (основной надёжный метод для Electron GUI)
         if shutil.which("wtype"):
             try:
-                # В kitty и Wayland-терминалах вставка выполняется через Ctrl+Shift+V или Ctrl+V
                 result = subprocess.run(
-                    ["wtype", "-M", "ctrl", "-M", "shift", "v", "-m", "shift", "-m", "ctrl"],
+                    ["wtype", "-M", "ctrl", "v", "-m", "ctrl"],
                     capture_output=True, text=True, timeout=3.0,
                 )
                 if result.returncode == 0:
                     success = True
-                    logger.info("📥 Вставлено через wtype (Ctrl+Shift+V)")
-                else:
-                    result = subprocess.run(
-                        ["wtype", "-M", "ctrl", "v", "-m", "ctrl"],
-                        capture_output=True, text=True, timeout=3.0,
-                    )
-                    if result.returncode == 0:
-                        success = True
-                        logger.info("📥 Вставлено через wtype (Ctrl+V)")
-                    else:
-                        logger.debug(f"wtype вернул код {result.returncode}: {result.stderr}")
+                    logger.info("📥 Вставлено через wtype (Ctrl+V)")
             except Exception as e:
                 logger.debug(f"wtype ошибка: {e}")
 
-        # Способ 2: ydotool Ctrl+Shift+V / Ctrl+V (fallback)
+        # Способ 2: ydotool Ctrl+V (fallback)
         if not success:
-            # Для kitty стандартная комбинация вставки — Ctrl+Shift+V:
-            # 29 = KEY_LEFTCTRL, 42 = KEY_LEFTSHIFT, 47 = KEY_V
-            success = self._run_ydotool("key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0")
+            # 29 = KEY_LEFTCTRL, 47 = KEY_V
+            success = self._run_ydotool("key", "29:1", "47:1", "47:0", "29:0")
             if success:
-                logger.info("📥 Вставлено через ydotool (Ctrl+Shift+V)")
-            else:
-                success = self._run_ydotool("key", "29:1", "47:1", "47:0", "29:0")
-                if success:
-                    logger.info("📥 Вставлено через ydotool (Ctrl+V)")
+                logger.info("📥 Вставлено через ydotool (Ctrl+V)")
 
-        # Способ 3: ydotool type (самый надёжный прямой ввод текста)
+        # Способ 3: Прямая печать содержимого буфера
         if not success:
-            logger.warning("Ctrl+V не сработал, использую ydotool type")
-            success = self._run_ydotool("type", "-d", "5", "--", content)
-            if success:
-                logger.info("📥 Вставлено через ydotool type")
+            if shutil.which("wtype"):
+                logger.warning("Ctrl+V не сработал, печатаю содержимое через wtype")
+                try:
+                    res = subprocess.run(["wtype", "--", content], capture_output=True, timeout=10.0)
+                    if res.returncode == 0:
+                        success = True
+                        logger.info("📥 Вставлено через прямую печать wtype")
+                except Exception as e:
+                    logger.debug(f"wtype печать не удалась: {e}")
+
+            if not success:
+                logger.warning("Печатаю содержимое через ydotool type")
+                success = self._run_ydotool("type", "-d", "5", "--", content)
+                if success:
+                    logger.info("📥 Вставлено через ydotool type")
 
         if success:
             if and_send:
@@ -580,7 +611,8 @@ class AntigravityController:
 
     def type_text(self, text: str, and_send: bool = False) -> None:
         """
-        Печатает распознанный текст через wtype и опционально нажимает Enter.
+        Печатает распознанный текст через wtype (с поддержкой кириллицы)
+        с fallback на ydotool type и опционально нажимает Enter.
         """
         if not text:
             logger.warning("Попытка ввода пустого текста.")
@@ -592,19 +624,25 @@ class AntigravityController:
         self.activate_antigravity_window()
         time.sleep(0.2)
 
-        try:
-            result = subprocess.run(
-                ["wtype", "--", text],
-                capture_output=True, text=True, timeout=10.0,
-            )
-            success = (result.returncode == 0)
-            if success:
-                logger.debug(f"wtype напечатал текст: {text[:40]}")
-            else:
-                logger.error(f"wtype вернул ошибку: {result.stderr.strip()}")
-        except Exception as e:
-            logger.error(f"Ошибка wtype: {e}")
-            success = False
+        success = False
+        if shutil.which("wtype"):
+            try:
+                result = subprocess.run(
+                    ["wtype", "--", text],
+                    capture_output=True, text=True, timeout=10.0,
+                )
+                if result.returncode == 0:
+                    success = True
+                    logger.debug(f"wtype напечатал текст: {text[:40]}")
+                else:
+                    logger.error(f"wtype вернул ошибку: {result.stderr.strip()}")
+            except Exception as e:
+                logger.error(f"Ошибка wtype: {e}")
+
+        # Fallback на ydotool type, если wtype отсутствует или дал сбой
+        if not success:
+            logger.warning("Попытка ввода через ydotool type (fallback)")
+            success = self._run_ydotool("type", "-d", "5", "--", text)
 
         if success:
             if and_send:
@@ -681,23 +719,17 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
     if clean in ["справка", "помощь", "команды", "help"]:
         return ("HELP",)
 
-    # 3. Вставка из буфера с отправкой ("вставь и отправь")
-    for pattern in ["вставь и отправь", "вставить и отправить", "вставь и отправить", "вставить и отправь"]:
-        if clean == pattern or clean.startswith(pattern):
+    # 3. Вставка из буфера (с отправкой или без)
+    if any(clean.startswith(p) for p in ["вставь", "вставить", "вставка"]):
+        if any(s in clean for s in ["отправ", "пошли", "запусти", "выполни"]):
             return ("PASTE_AND_SEND",)
+        return ("PASTE",)
 
-    # 4. Вставка из буфера без отправки ("вставь")
-    for pattern in ["вставь", "вставить", "вставка"]:
-        if clean == pattern or clean.startswith(pattern):
-            return ("PASTE",)
+    # 4. Просто отправка ("отправь")
+    if any(clean == p or clean.startswith(p + " ") for p in ["отправь", "отправить", "выполни", "выполнить", "пошли", "послать"]):
+        return ("SEND",)
 
-    # 5. Просто отправка ("отправь")
-    for pattern in ["отправь", "отправить", "выполни", "выполнить", "пошли", "послать"]:
-        if clean == pattern:
-            return ("SEND",)
-
-    # 6. Ввод текста: "напиши [текст]" или "напиши [текст] и отправь"
-    # Расширенные триггеры для ввода текста (с учётом ошибок Vosk)
+    # 5. Ввод текста: "напиши [текст]" или "напиши [текст] и отправь"
     TYPE_TRIGGERS = [
         "напиши ", "напишите ", "на пиши ", "на пишите ",
         "напечатай ", "напечатайте ", "на печатай ",
@@ -713,14 +745,12 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
 
     for prefix in TYPE_TRIGGERS:
         if prefix in clean:
-            # Находим позицию префикса (первое вхождение)
             idx = clean.find(prefix)
-            body = clean[idx + len(prefix):].strip()
-            # Убираем ведущие знаки препинания
-            body = body.lstrip(" ,:;-")
+            body = clean[idx + len(prefix):].strip().lstrip(" ,:;-")
             if not body:
                 continue
-            # Проверяем суффикс отправки
+            if body.startswith("пожалуйста "):
+                body = body[len("пожалуйста "):].strip()
             send = False
             for suffix in SEND_SUFFIXES:
                 if body.endswith(suffix):
@@ -734,7 +764,7 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
                     return ("TYPE", body)
             break
 
-    # 7. Нажатие клавиш с префиксом ("нажми три", "нажми один два три")
+    # 6. Нажатие клавиш с префиксом ("нажми три", "нажми один два три")
     for prefix in ["нажми ", "нажать ", "жми ", "кликни ", "нажмите "]:
         if clean.startswith(prefix):
             body = clean[len(prefix):].strip()
@@ -742,19 +772,21 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
             if codes:
                 return ("KEYS", codes, names)
 
-    # 8. Прямой ввод клавиш без префикса (например, если сказано просто: "энтер", "стрелка вверх")
+    # 7. Прямой ввод клавиш без префикса (например: "энтер", "стрелка вверх")
     words = clean.split()
     codes, names, consumed = parse_key_tokens(words)
     meaningful_words = [w for w in words if w not in FILLER_WORDS]
     if codes and consumed > 0 and consumed == len(meaningful_words):
         return ("KEYS", codes, names)
 
-    # 9. Запасной разбор, если фраза начинается с глагола действия
-    for verb in ["напиши", "напечатай", "введи", "набери"]:
+    # 8. Запасной разбор, если фраза начинается с глагола действия
+    for verb in ["напиши", "напишите", "напечатай", "напечатайте", "введи", "введите", "набери", "наберите"]:
         if clean.startswith(verb):
             body = clean[len(verb):].strip(" ,:;-")
             if body.startswith("ка ") or body.startswith("-ка "):
                 body = body.split(" ", 1)[-1].strip(" ,:;-")
+            if body.startswith("пожалуйста "):
+                body = body[len("пожалуйста "):].strip()
             if body:
                 for suffix in SEND_SUFFIXES:
                     if body.endswith(suffix):
@@ -768,14 +800,6 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
             codes, names, _ = parse_key_tokens(body.split())
             if codes:
                 return ("KEYS", codes, names)
-
-    if clean.startswith("вставь") or clean.startswith("вставить"):
-        if "отправ" in clean:
-            return ("PASTE_AND_SEND",)
-        return ("PASTE",)
-
-    if clean.startswith("отправь") or clean.startswith("отправить"):
-        return ("SEND",)
 
     return ("UNKNOWN", clean)
 
@@ -804,8 +828,8 @@ def print_help_table() -> None:
  2. ВСТАВКА ИЗ БУФЕРА   | "вставь"                      | wl-paste + Ctrl+V
                         | "вставь и отправь"            | Вставка + Enter
 ------------------------+-------------------------------+--------------------
- 3. ВВОД ТЕКСТА         | "напиши git status"           | ydotool type [текст]
-                        | "напиши cargo test и отправь" | ydotool type + Enter
+ 3. ВВОД ТЕКСТА         | "напиши git status"           | wtype / ydotool type
+                        | "напиши cargo test и отправь" | ввод текста + Enter
 ------------------------+-------------------------------+--------------------
  4. ОТПРАВКА            | "отправь"                     | Клавиша Enter
 ------------------------+-------------------------------+--------------------
@@ -852,7 +876,7 @@ def main():
     print(" 🚀 Antigravity Voice Controller v0.1v (Beta)")
     print("=" * 60)
     print(" 🌐 Wayland / Hyprland / CachyOS")
-    print(" 🎤 Vosk + 🔊 Festival + ⌨️  ydotool")
+    print(" 🎤 Vosk + 🔊 Festival + ⌨️  wtype / ydotool")
     print("=" * 60)
 
     # Проверка зависимостей Python
@@ -938,10 +962,20 @@ def main():
                 except queue.Empty:
                     continue
 
-                if recognizer.AcceptWaveform(data):
-                    res_json = json.loads(recognizer.Result())
-                    phrase = res_json.get("text", "").strip()
+                try:
+                    accepted = recognizer.AcceptWaveform(data)
+                except Exception as e:
+                    logger.debug(f"Ошибка AcceptWaveform: {e}")
+                    continue
 
+                if accepted:
+                    try:
+                        res_json = json.loads(recognizer.Result())
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.debug(f"Не удалось распарсить JSON Vosk: {e}")
+                        continue
+
+                    phrase = res_json.get("text", "").strip()
                     if not phrase:
                         continue
 
