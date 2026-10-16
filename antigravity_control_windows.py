@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-Голосовой контроллер Antigravity 2.0 для Windows 10/11
+Голосовой контроллер Antigravity 2.0 v0.3 (Windows Beta)
 =============================================================================
 Архитектура:
   - Распознавание речи: Vosk (оффлайн, русская модель vosk-model-small-ru-0.22)
@@ -11,6 +11,7 @@
   - Эмуляция клавиатуры и текста: keyboard (поддерживает ввод кириллицы)
   - Буфер обмена: pyperclip
   - Управление окнами и фокусом: pygetwindow + pywin32 (fallback)
+  - Push-to-Talk: клавиша F9 (библиотека keyboard, опционально)
 
 Установка зависимостей в Windows:
   pip install vosk sounddevice pyttsx3 pyperclip keyboard pygetwindow pywin32
@@ -34,7 +35,7 @@ import logging
 import argparse
 import threading
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict, Any
 
 # ---------------------------------------------------------------------------
 # 1. Цветное форматирование логов в консоли Windows
@@ -72,7 +73,143 @@ if sys.platform == "win32":
     os.system("")
 
 # ---------------------------------------------------------------------------
-# 2. Маппинг клавиш для библиотеки keyboard
+# 2. Модуль статистики и истории сессии
+# ---------------------------------------------------------------------------
+class SessionStats:
+    """Учёт статистики распознавания и выполнения команд."""
+    def __init__(self):
+        self.stats: Dict[str, Any] = {
+            "commands": 0,
+            "recognized": 0,
+            "errors": 0,
+            "start_time": time.time(),
+        }
+
+    def record_recognized(self) -> None:
+        """Фиксирует факт распознавания любой фразы."""
+        self.stats["recognized"] += 1
+
+    def record_command(self) -> None:
+        """Фиксирует факт успешного выполнения команды."""
+        self.stats["commands"] += 1
+
+    def record_error(self) -> None:
+        """Фиксирует ошибку распознавания или выполнения."""
+        self.stats["errors"] += 1
+
+    def get_summary(self) -> str:
+        """Формирует форматированный отчёт по статистике."""
+        elapsed = max(1.0, time.time() - self.stats["start_time"])
+        minutes = elapsed / 60.0
+        cpm = self.stats["commands"] / minutes
+        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        lines = [
+            "\n" + "=" * 55,
+            " 📊 СТАТИСТИКА СЕССИИ VOICEGRAVITY (WINDOWS)",
+            "=" * 55,
+            f" 🗣️  Всего распознано фраз:     {self.stats['recognized']}",
+            f" ⚙️  Выполнено команд:          {self.stats['commands']}",
+            f" ⚠️  Ошибок / не распознано:    {self.stats['errors']}",
+            f" ⏱️  Время работы сессии:       {elapsed_str}",
+            f" 📈 Средняя скорость:           {cpm:.1f} команд/мин",
+            "=" * 55,
+        ]
+        return "\n".join(lines)
+
+
+class CommandHistory:
+    """Логирование и просмотр истории команд в history.log."""
+    def __init__(self, log_path: Optional[Path] = None):
+        if log_path is None:
+            self.log_path = Path.home() / "VoiceGravity" / "history.log"
+        else:
+            self.log_path = Path(log_path)
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.debug(f"Не удалось создать каталог истории: {e}")
+
+    def log(self, phrase: str, cmd_type: str) -> None:
+        """Добавляет строку в историю команд."""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] {phrase} -> {cmd_type}\n"
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception as e:
+            logger.debug(f"Ошибка записи в history.log: {e}")
+
+    def get_recent(self, count: int = 10) -> List[str]:
+        """Возвращает последние N записей из файла истории."""
+        if not self.log_path.exists():
+            return []
+        try:
+            with open(self.log_path, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            return lines[-count:]
+        except Exception as e:
+            logger.debug(f"Ошибка чтения history.log: {e}")
+            return []
+
+
+# ---------------------------------------------------------------------------
+# 3. Менеджер горячей клавиши (Push-to-Talk)
+# ---------------------------------------------------------------------------
+class HotkeyManager:
+    """
+    Отслеживает состояние клавиши F9 через библиотеку keyboard.
+    Если keyboard недоступен, автоматически переключается в безопасный режим (--always-on).
+    """
+    def __init__(self, key: str = "f9", always_on: bool = False):
+        self.key = key
+        self.always_on = always_on
+        self.keyboard_available = False
+        self._last_pressed_time = 0.0
+
+        if not self.always_on:
+            try:
+                import keyboard
+                _ = keyboard.is_pressed(self.key)
+                self.keyboard_available = True
+                logger.info(f"⚡ Режим Push-to-Talk активен: удерживайте [{self.key.upper()}] во время речи.")
+            except (ImportError, Exception) as e:
+                logger.warning(
+                    f"⚠️  Модуль 'keyboard' недоступен ({e}). "
+                    f"Активирован режим постоянного слушания (--always-on)."
+                )
+                self.always_on = True
+
+    def poll(self) -> None:
+        """Опрашивает состояние клавиши в цикле захвата звука."""
+        if self.always_on or not self.keyboard_available:
+            return
+        try:
+            import keyboard
+            if keyboard.is_pressed(self.key):
+                self._last_pressed_time = time.time()
+        except Exception:
+            pass
+
+    def is_active(self) -> bool:
+        """
+        Проверяет, разрешена ли обработка команды:
+        - Либо флаг --always-on
+        - Либо F9 нажата в данный момент
+        - Либо F9 удерживалась в процессе произнесения фразы (в пределах последних 1.5 сек)
+        """
+        if self.always_on or not self.keyboard_available:
+            return True
+        try:
+            import keyboard
+            if keyboard.is_pressed(self.key):
+                return True
+        except Exception:
+            pass
+        return (time.time() - self._last_pressed_time) < 1.5
+
+
+# ---------------------------------------------------------------------------
+# 4. Маппинг клавиш для библиотеки keyboard
 # ---------------------------------------------------------------------------
 # Двухсловные фразы клавиш
 MULTI_WORD_KEY_MAP = {
@@ -212,18 +349,20 @@ FILLER_WORDS = {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Синтез речи через pyttsx3 (SAPI5 на Windows) в отдельном потоке
+# 5. Синтез речи через pyttsx3 (SAPI5 на Windows) с поддержкой смены голосов
 # ---------------------------------------------------------------------------
 class VoiceSynthesizer:
     """
     Асинхронный синтезатор речи на базе pyttsx3 (SAPI5).
-    Инициализация и вызовы say/runAndWait происходят строго в выделенном
-    потоке-демоне, чтобы не блокировать распознавание речи микрофона.
+    Поддерживает динамическое переключение между женским (Irina) и мужским (Pavel) голосами.
+    Все обращения к SAPI5 изолированы в рабочем потоке с инициализацией COM.
     """
-    def __init__(self, speed: int = 200, enabled: bool = True):
+    def __init__(self, speed: int = 200, enabled: bool = True, voice: str = "ru_female"):
         self.enabled = enabled
         self.speed = speed
-        self._queue: queue.Queue[Optional[str]] = queue.Queue()
+        self.target_voice = voice
+        self.current_voice = "ru_female" if ("fem" in voice.lower() or "жен" in voice.lower() or "irina" in voice.lower()) else "ru_male"
+        self._queue: queue.Queue[Any] = queue.Queue()
         self._thread = threading.Thread(target=self._worker, daemon=True, name="TTS-Worker")
         self._engine = None
 
@@ -232,7 +371,6 @@ class VoiceSynthesizer:
 
     def _worker(self):
         """Рабочий поток SAPI5 TTS с корректной инициализацией COM."""
-        # На Windows в отдельных потоках требуется явная инициализация COM
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -240,38 +378,69 @@ class VoiceSynthesizer:
             except Exception as e:
                 logger.debug(f"CoInitialize warning: {e}")
 
+        voice_ids = {"female": None, "male": None}
         try:
             import pyttsx3
-            # Инициализация SAPI5 внутри рабочего потока
             self._engine = pyttsx3.init("sapi5")
             self._engine.setProperty("rate", self.speed)
 
-            # Выбор русского голоса (Microsoft Irina, Pavel или любой русский)
+            # Поиск голосов Microsoft Irina и Pavel
             voices = self._engine.getProperty("voices")
-            russian_voice_found = False
-            for voice in voices:
-                v_name = voice.name.lower()
-                v_id = voice.id.lower()
-                if any(tag in v_name or tag in v_id for tag in ["irina", "pavel", "russian", "ru-ru", "ru"]):
-                    self._engine.setProperty("voice", voice.id)
-                    russian_voice_found = True
-                    logger.info(f"🎙️ Выбран голос TTS: {voice.name}")
-                    break
+            for v in voices:
+                v_name = v.name.lower()
+                v_id = v.id.lower()
+                if any(tag in v_name or tag in v_id for tag in ["irina", "женск"]):
+                    if not voice_ids["female"]:
+                        voice_ids["female"] = v.id
+                if any(tag in v_name or tag in v_id for tag in ["pavel", "мужск"]):
+                    if not voice_ids["male"]:
+                        voice_ids["male"] = v.id
 
-            if not russian_voice_found:
-                logger.debug("Русский голос SAPI5 не найден, используется стандартный голос Windows.")
+            # Fallback для русского языка
+            if not voice_ids["female"]:
+                for v in voices:
+                    if any(tag in v.name.lower() or tag in v.id.lower() for tag in ["russian", "ru-ru", "ru"]):
+                        voice_ids["female"] = v.id
+                        break
+
+            if not voice_ids["male"] and voice_ids["female"]:
+                voice_ids["male"] = voice_ids["female"]
+            elif not voice_ids["female"] and voice_ids["male"]:
+                voice_ids["female"] = voice_ids["male"]
+
+            desired = "female" if self.current_voice == "ru_female" else "male"
+            chosen_id = voice_ids.get(desired) or (voices[0].id if voices else None)
+            if chosen_id:
+                self._engine.setProperty("voice", chosen_id)
+                logger.info(f"🎙️ Выбран голос TTS: {self.current_voice}")
+
         except Exception as e:
             logger.warning(f"Ошибка инициализации pyttsx3 SAPI5: {e}. TTS отключён.")
             self._engine = None
 
         try:
             while True:
-                text = self._queue.get()
-                if text is None:
+                item = self._queue.get()
+                if item is None:
                     break
-                if self._engine and text:
+
+                # Обработка смены голоса потокобезопасно внутри COM-потока
+                if isinstance(item, tuple) and item[0] == "__SET_VOICE__":
+                    new_mode = item[1]
+                    vid = voice_ids.get("female" if new_mode == "ru_female" else "male")
+                    if vid and self._engine:
+                        try:
+                            self._engine.setProperty("voice", vid)
+                            display_name = "мужской" if new_mode == "ru_male" else "женский"
+                            logger.info(f"🎙️ Голос переключён на: {display_name} ({new_mode})")
+                        except Exception as e:
+                            logger.debug(f"Ошибка переключения голоса: {e}")
+                    self._queue.task_done()
+                    continue
+
+                if self._engine and isinstance(item, str) and item:
                     try:
-                        self._engine.say(text)
+                        self._engine.say(item)
                         self._engine.runAndWait()
                     except Exception as e:
                         logger.debug(f"Ошибка воспроизведения речи: {e}")
@@ -289,6 +458,15 @@ class VoiceSynthesizer:
         if self.enabled and text:
             self._queue.put(text)
 
+    def toggle_voice(self) -> str:
+        """Переключает голос между женским (Irina) и мужским (Pavel)."""
+        new_voice = "ru_male" if self.current_voice == "ru_female" else "ru_female"
+        self.current_voice = new_voice
+        self._queue.put(("__SET_VOICE__", new_voice))
+        display_name = "мужской" if new_voice == "ru_male" else "женский"
+        self.speak(f"Установлен {display_name} голос")
+        return new_voice
+
     def stop(self) -> None:
         """Останавливает рабочий поток TTS."""
         if self.enabled and self._thread.is_alive():
@@ -297,7 +475,7 @@ class VoiceSynthesizer:
 
 
 # ---------------------------------------------------------------------------
-# 4. Контроллер ввода и управления окнами для Windows
+# 6. Контроллер ввода и управления окнами для Windows
 # ---------------------------------------------------------------------------
 class AntigravityController:
     """Управляет окном Antigravity 2.0 и эмуляцией ввода в Windows."""
@@ -491,7 +669,7 @@ class AntigravityController:
 
 
 # ---------------------------------------------------------------------------
-# 5. Парсер голосовых команд
+# 7. Парсер голосовых команд
 # ---------------------------------------------------------------------------
 def parse_key_tokens(words: List[str]) -> Tuple[List[str], List[str], int]:
     """
@@ -545,17 +723,29 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
     if clean in ["справка", "помощь", "команды", "help"]:
         return ("HELP",)
 
-    # 3. Вставка из буфера (с отправкой или без)
+    # 3. Статистика сессии
+    if clean in ["статистика", "статы", "покажи статистику", "stats", "status"]:
+        return ("STATS",)
+
+    # 4. История команд
+    if clean in ["история", "покажи историю", "история команд", "лог", "history"]:
+        return ("HISTORY",)
+
+    # 5. Смена голоса
+    if clean in ["смени голос", "поменяй голос", "переключи голос", "сменить голос", "другой голос"]:
+        return ("VOICE_CHANGE",)
+
+    # 6. Вставка из буфера (с отправкой или без)
     if any(clean.startswith(p) for p in ["вставь", "вставить", "вставка"]):
         if any(s in clean for s in ["отправ", "пошли", "запусти", "выполни"]):
             return ("PASTE_AND_SEND",)
         return ("PASTE",)
 
-    # 4. Просто отправка ("отправь")
+    # 7. Просто отправка ("отправь")
     if any(clean == p or clean.startswith(p + " ") for p in ["отправь", "отправить", "выполни", "выполнить", "пошли", "послать"]):
         return ("SEND",)
 
-    # 5. Ввод текста: "напиши [текст]" или "напиши [текст] и отправь"
+    # 8. Ввод текста: "напиши [текст]" или "напиши [текст] и отправь"
     TYPE_TRIGGERS = [
         "напиши ", "напишите ", "на пиши ", "на пишите ",
         "напечатай ", "напечатайте ", "на печатай ",
@@ -590,7 +780,7 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
                     return ("TYPE", body)
             break
 
-    # 6. Нажатие клавиш с префиксом ("нажми три", "нажми один два три")
+    # 9. Нажатие клавиш с префиксом ("нажми три", "нажми один два три")
     for prefix in ["нажми ", "нажать ", "жми ", "кликни ", "нажмите "]:
         if clean.startswith(prefix):
             body = clean[len(prefix):].strip()
@@ -598,14 +788,14 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
             if codes:
                 return ("KEYS", codes, names)
 
-    # 7. Прямой ввод клавиш без префикса (например: "энтер", "стрелка вверх")
+    # 10. Прямой ввод клавиш без префикса (например: "энтер", "стрелка вверх")
     words = clean.split()
     codes, names, consumed = parse_key_tokens(words)
     meaningful_words = [w for w in words if w not in FILLER_WORDS]
     if codes and consumed > 0 and consumed == len(meaningful_words):
         return ("KEYS", codes, names)
 
-    # 8. Запасной разбор, если фраза начинается с глагола действия
+    # 11. Запасной разбор, если фраза начинается с глагола действия
     for verb in ["напиши", "напишите", "напечатай", "напечатайте", "введи", "введите", "набери", "наберите"]:
         if clean.startswith(verb):
             body = clean[len(verb):].strip(" ,:;-")
@@ -631,13 +821,13 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# 6. Справка по командам
+# 8. Справка по командам
 # ---------------------------------------------------------------------------
 def print_help_table() -> None:
     """Выводит подробную справочную таблицу по голосовым командам."""
     help_text = """
 =============================================================================
-              СПРАВОЧНИК ГОЛОСОВЫХ КОМАНД ANTIGRAVITY (WINDOWS)
+         СПРАВОЧНИК ГОЛОСОВЫХ КОМАНД ANTIGRAVITY (WINDOWS v0.3 Beta)
 =============================================================================
  Категория              | Пример фразы                  | Действие
 ------------------------+-------------------------------+--------------------
@@ -659,15 +849,21 @@ def print_help_table() -> None:
 ------------------------+-------------------------------+--------------------
  4. ОТПРАВКА            | "отправь"                     | Клавиша Enter
 ------------------------+-------------------------------+--------------------
- 5. СИСТЕМА             | "справка" / "помощь"          | Показать эту таблицу
+ 5. СИСТЕМА И НАСТРОЙКИ | "справка" / "помощь"          | Показать эту таблицу
+                        | "статистика"                  | Статистика сессии
+                        | "история"                     | Последние 10 команд
+                        | "смени голос"                 | Переключить голос (М/Ж)
                         | "стоп" / "выход"              | Завершить работу
+=============================================================================
+ ⚡ Push-to-Talk: удерживайте клавишу F9 во время речи.
+    Флаг --always-on отключает необходимость удержания клавиши.
 =============================================================================
 """
     print(help_text)
 
 
 # ---------------------------------------------------------------------------
-# 7. Точка входа и главный цикл
+# 9. Точка входа и главный цикл
 # ---------------------------------------------------------------------------
 def find_default_model_path() -> str:
     """Определяет стандартный путь к модели Vosk в Windows."""
@@ -699,6 +895,18 @@ def main():
         help="Отключить голосовые подтверждения синтезатора речи"
     )
     parser.add_argument(
+        "--voice",
+        type=str,
+        default="ru_female",
+        choices=["ru_female", "ru_male", "female", "male", "irina", "pavel"],
+        help="Голос синтезатора речи pyttsx3: ru_female (Irina) или ru_male (Pavel)"
+    )
+    parser.add_argument(
+        "--always-on",
+        action="store_true",
+        help="Режим постоянного слушания (не требовать удержания клавиши F9)"
+    )
+    parser.add_argument(
         "--device",
         type=int,
         default=None,
@@ -708,10 +916,11 @@ def main():
 
     # Вывод баннера Windows-версии
     print("\n" + "=" * 60)
-    print(" 🚀 Antigravity 2.0 Voice Controller v0.1 (Windows Beta)")
+    print(" 🚀 Antigravity 2.0 Voice Controller v0.3 (Windows Beta)")
     print("=" * 60)
     print(" 🪟 Windows 10/11")
     print(" 🎤 Vosk + 🔊 pyttsx3 (SAPI5) + ⌨️  keyboard + 📋 pyperclip")
+    print(" ⚡ Push-to-Talk: " + ("ВЫКЛЮЧЕН (--always-on)" if args.always_on else "Клавиша F9"))
     print("=" * 60)
 
     # 1. Проверка внешних библиотек
@@ -746,8 +955,11 @@ def main():
         logger.critical(f"Ошибка загрузки модели Vosk: {e}")
         sys.exit(1)
 
-    # 3. Инициализация TTS и контроллера
-    tts = VoiceSynthesizer(enabled=not args.no_tts)
+    # 3. Инициализация подсистем
+    stats = SessionStats()
+    history = CommandHistory()
+    hotkey_mgr = HotkeyManager(key="f9", always_on=args.always_on)
+    tts = VoiceSynthesizer(enabled=not args.no_tts, voice=args.voice)
     controller = AntigravityController(tts=tts)
 
     # 4. Проверка запущенного окна Antigravity 2.0
@@ -800,6 +1012,8 @@ def main():
             callback=audio_callback
         ):
             while is_running.is_set():
+                hotkey_mgr.poll()
+
                 try:
                     data = audio_queue.get(timeout=0.2)
                 except queue.Empty:
@@ -822,50 +1036,92 @@ def main():
                     if not phrase:
                         continue
 
+                    stats.record_recognized()
+
+                    # Проверка Push-to-Talk (F9)
+                    if not hotkey_mgr.is_active():
+                        logger.debug(f"🔇 [F9 не нажата, пропуск]: «{phrase}»")
+                        continue
+
                     logger.info(f"🗣️  Распознано: «\033[96m{phrase}\033[0m»")
 
                     cmd_data = parse_voice_command(phrase)
                     cmd_type = cmd_data[0]
+                    history.log(phrase, cmd_type)
 
                     if cmd_type == "PASTE_AND_SEND":
                         controller.paste_from_clipboard(and_send=True)
+                        stats.record_command()
 
                     elif cmd_type == "PASTE":
                         controller.paste_from_clipboard(and_send=False)
+                        stats.record_command()
 
                     elif cmd_type == "SEND":
                         controller.press_enter(speak=True)
+                        stats.record_command()
 
                     elif cmd_type == "TYPE_AND_SEND":
                         text_to_type = cmd_data[1]
                         controller.type_text(text_to_type, and_send=True)
+                        stats.record_command()
 
                     elif cmd_type == "TYPE":
                         text_to_type = cmd_data[1]
                         controller.type_text(text_to_type, and_send=False)
+                        stats.record_command()
 
                     elif cmd_type == "KEYS":
                         codes = cmd_data[1]
                         names = cmd_data[2]
                         controller.press_keys(codes, names)
+                        stats.record_command()
+
+                    elif cmd_type == "STATS":
+                        print(stats.get_summary())
+                        tts.speak(f"Выполнено {stats.stats['commands']} команд")
+                        stats.record_command()
+
+                    elif cmd_type == "HISTORY":
+                        recent_logs = history.get_recent(10)
+                        print("\n" + "=" * 55)
+                        print(" 📝 ПОСЛЕДНИЕ 10 КОМАНД (ИСТОРИЯ)")
+                        print("=" * 55)
+                        if recent_logs:
+                            for idx, item in enumerate(recent_logs, 1):
+                                print(f" {idx:2d}. {item}")
+                        else:
+                            print(" (История пока пуста)")
+                        print("=" * 55 + "\n")
+                        tts.speak("Показываю историю")
+                        stats.record_command()
+
+                    elif cmd_type == "VOICE_CHANGE":
+                        new_voice = tts.toggle_voice()
+                        stats.record_command()
 
                     elif cmd_type == "HELP":
                         print_help_table()
                         tts.speak("Вывожу справку по командам")
+                        stats.record_command()
 
                     elif cmd_type == "STOP":
                         logger.info("Завершение работы по голосовой команде.")
+                        stats.record_command()
+                        print(stats.get_summary())
                         tts.speak("Завершение работы")
                         time.sleep(0.5)
                         is_running.clear()
                         break
 
                     elif cmd_type == "UNKNOWN":
+                        stats.record_error()
                         logger.warning(f"Команда не распознана: «{phrase}». Скажите 'справка' для списка команд.")
 
     except Exception as e:
         logger.critical(f"Критическая ошибка захвата звука: {e}")
     finally:
+        print(stats.get_summary())
         logger.info("👋 Остановка синтезатора речи и завершение работы...")
         tts.stop()
         logger.info("✅ Приложение успешно завершило работу.")
