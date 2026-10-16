@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1%20Beta-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-0.2%20Beta-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-green" alt="Platform"/>
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="License"/>
 </p>
@@ -113,7 +113,7 @@ python antigravity_control_windows.py
 
 ## 🚀 Версия
 
-**v0.1 (Beta)** — первая публичная версия.
+**v0.2 (Beta)** — публичная бета-версия.
 
 - ✅ Работает на Linux (CachyOS, Hyprland)
 - ✅ Работает на Windows (Beta)
