@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-Голосовой контроллер терминала Antigravity v0.1v (Beta) для CachyOS / Wayland
+Голосовой контроллер терминала Antigravity v0.3 (Beta) для CachyOS / Wayland
 =============================================================================
 Архитектура:
   - Распознавание речи: Vosk (оффлайн, модель vosk-model-small-ru-0.22)
   - Захват звука: sounddevice (16 кГц, моно, 16-бит PCM)
-  - Синтез речи: Festival + voice_msu_ru_nsh_clunits (выполняется в отдельном потоке)
-  - Эмуляция ввода: ydotool через сокет демона (/run/ydotoold.socket)
+  - Синтез речи: Festival (серверный режим, поддержка мужского и женского голоса)
+  - Эмуляция ввода: wtype (Wayland-native) + ydotool (/run/ydotoold.socket)
   - Буфер обмена Wayland: wl-clipboard (wl-paste)
+  - Push-to-Talk: клавиша F9 (библиотека keyboard, опционально)
 
 Поддерживаемые голосовые команды:
   1. Нажатие клавиш:
@@ -25,8 +26,11 @@
      - "напиши [текст] и отправь"   -> ввод текста + Enter
   4. Отправка:
      - "отправь"                    -> Enter
-  5. Управление приложением:
+  5. Управление и система:
      - "справка" / "помощь"         -> вывод таблицы команд
+     - "статистика"                 -> статистика распознавания и команд
+     - "история"                    -> последние 10 выполненных команд
+     - "смени голос"                -> переключение голоса TTS (М/Ж)
      - "стоп" / "выход"             -> завершение работы
 =============================================================================
 """
@@ -44,13 +48,9 @@ import argparse
 import threading
 import subprocess
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict, Any
 
-# ---------------------------------------------------------------------------
-# 1. Настройка цветного логирования с эмодзи-статусами
-# ---------------------------------------------------------------------------
 class CustomFormatter(logging.Formatter):
-    """Форматтер консоли с эмодзи и ANSI-цветами для наглядного статуса."""
     FORMATS = {
         logging.DEBUG: "🔍 \033[90m%(asctime)s [DEBUG] %(message)s\033[0m",
         logging.INFO: "\033[92m%(message)s\033[0m",
@@ -77,15 +77,121 @@ console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(CustomFormatter())
 logger.addHandler(console_handler)
 
-# ---------------------------------------------------------------------------
-# 2. Коды клавиш Linux Input Event (/usr/include/linux/input-event-codes.h)
-# ---------------------------------------------------------------------------
-# Стандартные скан-коды ядра Linux, используемые ydotool:
-# KEY_ESC = 1, KEY_1 = 2, KEY_2 = 3, KEY_3 = 4, KEY_4 = 5 ... KEY_0 = 11
+class SessionStats:
+    def __init__(self):
+        self.stats: Dict[str, Any] = {
+            "commands": 0,
+            "recognized": 0,
+            "errors": 0,
+            "start_time": time.time(),
+        }
+
+    def record_recognized(self) -> None:
+        self.stats["recognized"] += 1
+
+    def record_command(self) -> None:
+        self.stats["commands"] += 1
+
+    def record_error(self) -> None:
+        self.stats["errors"] += 1
+
+    def get_summary(self) -> str:
+        elapsed = max(1.0, time.time() - self.stats["start_time"])
+        minutes = elapsed / 60.0
+        cpm = self.stats["commands"] / minutes
+        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        lines = [
+            "\n" + "=" * 55,
+            " 📊 СТАТИСТИКА СЕССИИ VOICEGRAVITY",
+            "=" * 55,
+            f" 🗣️  Всего распознано фраз:     {self.stats['recognized']}",
+            f" ⚙️  Выполнено команд:          {self.stats['commands']}",
+            f" ⚠️  Ошибок / не распознано:    {self.stats['errors']}",
+            f" ⏱️  Время работы сессии:       {elapsed_str}",
+            f" 📈 Средняя скорость:           {cpm:.1f} команд/мин",
+            "=" * 55,
+        ]
+        return "\n".join(lines)
+
+
+class CommandHistory:
+    def __init__(self, log_path: Optional[Path] = None):
+        if log_path is None:
+            self.log_path = Path.home() / "VoiceGravity" / "history.log"
+        else:
+            self.log_path = Path(log_path)
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.debug(f"Не удалось создать каталог истории: {e}")
+
+    def log(self, phrase: str, cmd_type: str) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] {phrase} -> {cmd_type}\n"
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception as e:
+            logger.debug(f"Ошибка записи в history.log: {e}")
+
+    def get_recent(self, count: int = 10) -> List[str]:
+        if not self.log_path.exists():
+            return []
+        try:
+            with open(self.log_path, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            return lines[-count:]
+        except Exception as e:
+            logger.debug(f"Ошибка чтения history.log: {e}")
+            return []
+
+
+class HotkeyManager:
+    def __init__(self, key: str = "f9", always_on: bool = False):
+        self.key = key
+        self.always_on = always_on
+        self.keyboard_available = False
+        self._last_pressed_time = 0.0
+
+        if not self.always_on:
+            try:
+                import keyboard
+                _ = keyboard.is_pressed(self.key)
+                self.keyboard_available = True
+                logger.info(f"⚡ Режим Push-to-Talk активен: удерживайте [{self.key.upper()}] во время речи.")
+            except (ImportError, Exception) as e:
+                logger.warning(
+                    f"⚠️  Модуль 'keyboard' недоступен ({e}). "
+                    f"Активирован режим постоянного слушания (--always-on)."
+                )
+                self.always_on = True
+
+    def poll(self) -> None:
+        if self.always_on or not self.keyboard_available:
+            return
+        try:
+            import keyboard
+            if keyboard.is_pressed(self.key):
+                self._last_pressed_time = time.time()
+        except Exception:
+            pass
+
+    def is_active(self) -> bool:
+        if self.always_on or not self.keyboard_available:
+            return True
+        try:
+            import keyboard
+            if keyboard.is_pressed(self.key):
+                return True
+        except Exception:
+            pass
+        return (time.time() - self._last_pressed_time) < 1.5
+
+
 KEY_ESC       = 1
 KEY_1         = 2
 KEY_2         = 3
-KEY_3         = 4   # Ядерный скан-код KEY_3 равен 4 (KEY_1 = 2, KEY_2 = 3)
+KEY_3         = 4
 KEY_4         = 5
 KEY_5         = 6
 KEY_6         = 7
@@ -111,7 +217,6 @@ KEY_LEFT      = 105
 KEY_RIGHT     = 106
 KEY_DOWN      = 108
 
-# Двухсловные фразы клавиш (проверяются анализатором в первую очередь)
 MULTI_WORD_KEY_MAP = {
     ("стрелка", "вверх"):   (KEY_UP, "Стрелка вверх"),
     ("стрелку", "вверх"):   (KEY_UP, "Стрелка вверх"),
@@ -138,9 +243,7 @@ MULTI_WORD_KEY_MAP = {
     ("f", "пять"):          (KEY_F5, "F5"),
 }
 
-# Однословные клавиши и их русскоязычные синонимы
 SINGLE_WORD_KEY_MAP = {
-    # Цифры 0-9
     "ноль":      (KEY_0, "0"),
     "0":         (KEY_0, "0"),
     "один":      (KEY_1, "1"),
@@ -177,18 +280,15 @@ SINGLE_WORD_KEY_MAP = {
     "девятка":   (KEY_9, "9"),
     "9":         (KEY_9, "9"),
 
-    # Enter (Ввод)
     "энтер":     (KEY_ENTER, "Enter"),
     "ентер":     (KEY_ENTER, "Enter"),
     "ввод":      (KEY_ENTER, "Enter"),
     "enter":     (KEY_ENTER, "Enter"),
 
-    # Space (Пробел)
     "пробел":    (KEY_SPACE, "Space"),
     "спейс":     (KEY_SPACE, "Space"),
     "space":     (KEY_SPACE, "Space"),
 
-    # Escape (Отмена)
     "эскейп":    (KEY_ESC, "Esc"),
     "ескейп":    (KEY_ESC, "Esc"),
     "эскейпт":   (KEY_ESC, "Esc"),
@@ -197,12 +297,10 @@ SINGLE_WORD_KEY_MAP = {
     "отмена":    (KEY_ESC, "Esc"),
     "esc":       (KEY_ESC, "Esc"),
 
-    # Tab (Табуляция)
     "таб":       (KEY_TAB, "Tab"),
     "табуляция": (KEY_TAB, "Tab"),
     "tab":       (KEY_TAB, "Tab"),
 
-    # Backspace (Удаление/стирание)
     "бэкспейс":  (KEY_BACKSPACE, "Backspace"),
     "бекспейс":  (KEY_BACKSPACE, "Backspace"),
     "стереть":   (KEY_BACKSPACE, "Backspace"),
@@ -211,13 +309,11 @@ SINGLE_WORD_KEY_MAP = {
     "удаление":  (KEY_BACKSPACE, "Backspace"),
     "backspace": (KEY_BACKSPACE, "Backspace"),
 
-    # Стрелки одиночными словами
     "вверх":     (KEY_UP, "Стрелка вверх"),
     "вниз":      (KEY_DOWN, "Стрелка вниз"),
     "влево":     (KEY_LEFT, "Стрелка влево"),
     "вправо":    (KEY_RIGHT, "Стрелка вправо"),
 
-    # F1 - F5
     "f1":        (KEY_F1, "F1"),
     "ф1":        (KEY_F1, "F1"),
     "f2":        (KEY_F2, "F2"),
@@ -229,7 +325,6 @@ SINGLE_WORD_KEY_MAP = {
     "f5":        (KEY_F5, "F5"),
     "ф5":        (KEY_F5, "F5"),
 
-    # Y / N (Да / Нет)
     "игрек":     (KEY_Y, "Y"),
     "вай":       (KEY_Y, "Y"),
     "y":         (KEY_Y, "Y"),
@@ -239,7 +334,6 @@ SINGLE_WORD_KEY_MAP = {
     "нет":       (KEY_N, "N"),
 }
 
-# Вспомогательные слова, которые игнорируются при разборе последовательностей клавиш
 FILLER_WORDS = {
     "клавиша", "клавиши", "клавишу",
     "кнопка", "кнопки", "кнопку",
@@ -249,17 +343,11 @@ FILLER_WORDS = {
     "на", "мне", "же"
 }
 
-# ---------------------------------------------------------------------------
-# 3. Асинхронный синтез речи (TTS) на базе Festival в серверном режиме
-# ---------------------------------------------------------------------------
 class VoiceSynthesizer:
-    """
-    Синтезатор речи через Festival в серверном режиме.
-    Сервер запускается один раз, все фразы отправляются через TCP-сокет.
-    """
-    def __init__(self, enabled: bool = True, port: int = 1314):
+    def __init__(self, enabled: bool = True, port: int = 1314, voice: str = "ru_female"):
         self.enabled = enabled
         self.port = port
+        self.current_voice = "ru_female" if "fem" in voice.lower() or "жен" in voice.lower() else "ru_male"
         self._queue = queue.Queue()
         self._server_process = None
         self._thread = None
@@ -267,28 +355,26 @@ class VoiceSynthesizer:
         if not self.enabled:
             return
 
-        # Запускаем festival --server
         if not self._start_server():
             logger.warning("Festival сервер не запущен. TTS отключён.")
             self.stop()
             self.enabled = False
             return
 
-        # Загружаем русский голос в сервер
         if not self._load_voice():
             logger.warning("Русский голос не загружен. TTS отключён.")
             self.stop()
             self.enabled = False
             return
 
-        # Запускаем воркер-поток
+        self._apply_voice_params(self.current_voice)
+
         self._thread = threading.Thread(target=self._worker, daemon=True, name="TTS-Worker")
         self._thread.start()
-        logger.info("🎙️ Festival сервер запущен, русский голос загружен.")
+        display_name = "женский" if self.current_voice == "ru_female" else "мужской"
+        logger.info(f"🎙️ Festival сервер запущен. Голос: {display_name} ({self.current_voice}).")
 
     def _start_server(self) -> bool:
-        """Запускает festival --server в фоне."""
-        # Проверяем, возможно сервер уже работает на этом порту
         try:
             with socket.create_connection(("localhost", self.port), timeout=0.3):
                 logger.info(f"Festival сервер уже запущен на порту {self.port}.")
@@ -305,7 +391,6 @@ class VoiceSynthesizer:
                 stderr=subprocess.DEVNULL,
                 env=env,
             )
-            # Ждём, пока сервер стартует
             for _ in range(20):
                 if self._server_process.poll() is not None:
                     logger.error(f"Festival сервер аварийно завершился с кодом {self._server_process.poll()}.")
@@ -323,11 +408,9 @@ class VoiceSynthesizer:
             return False
 
     def _send_scheme(self, scheme_code: str) -> bool:
-        """Отправляет Scheme-код в Festival сервер."""
         try:
             with socket.create_connection(("localhost", self.port), timeout=5) as sock:
                 sock.sendall(scheme_code.encode("utf-8") + b"\n")
-                # Ждём ответа (festival присылает "nil" после выполнения)
                 sock.settimeout(5)
                 try:
                     sock.recv(1024)
@@ -339,11 +422,29 @@ class VoiceSynthesizer:
             return False
 
     def _load_voice(self) -> bool:
-        """Загружает русский голос в сервер."""
         return self._send_scheme('(voice_msu_ru_nsh_clunits)')
 
+    def _apply_voice_params(self, voice_type: str) -> bool:
+        if "fem" in voice_type.lower() or "жен" in voice_type.lower():
+            scheme = "(set! duffint_params '((start 220) (end 180)))\n(Parameter.set 'Duration_Stretch 0.95)"
+        else:
+            scheme = "(set! duffint_params '((start 115) (end 90)))\n(Parameter.set 'Duration_Stretch 1.0)"
+        return self._send_scheme(scheme)
+
+    def set_voice(self, voice_type: str) -> str:
+        new_voice = "ru_female" if "fem" in voice_type.lower() or "жен" in voice_type.lower() else "ru_male"
+        self.current_voice = new_voice
+        self._apply_voice_params(new_voice)
+        return self.current_voice
+
+    def toggle_voice(self) -> str:
+        new_voice = "ru_male" if self.current_voice == "ru_female" else "ru_female"
+        self.set_voice(new_voice)
+        display_name = "мужской" if new_voice == "ru_male" else "женский"
+        self.speak(f"Установлен {display_name} голос")
+        return new_voice
+
     def _worker(self):
-        """Рабочий цикл: берёт фразы из очереди и отправляет в сервер."""
         while True:
             text = self._queue.get()
             if text is None:
@@ -360,16 +461,13 @@ class VoiceSynthesizer:
             self._queue.task_done()
 
     def speak(self, text: str) -> None:
-        """Добавляет фразу в очередь озвучки (не блокирует)."""
         if self.enabled and text:
             self._queue.put(text)
 
     def stop(self) -> None:
-        """Останавливает поток синтеза речи и завершает процесс сервера."""
         if self._thread and self._thread.is_alive():
             self._queue.put(None)
             self._thread.join(timeout=1.0)
-        # Завершаем сервер
         if self._server_process:
             try:
                 self._send_scheme('(exit)')
@@ -385,95 +483,66 @@ class VoiceSynthesizer:
             self._server_process = None
 
 
-# ---------------------------------------------------------------------------
-# 4. Контроллер эмуляции ввода (ydotool / wtype) и буфера обмена (wl-clipboard)
-# ---------------------------------------------------------------------------
 class AntigravityController:
-    """Управляет эмуляцией ввода через wtype / ydotool и буфером обмена Wayland."""
     def __init__(self, socket_path: str = "/run/ydotoold.socket", tts: Optional[VoiceSynthesizer] = None):
         self.socket_path = socket_path
         self.tts = tts
-        # Передаём сокет через переменную окружения без необходимости в sudo
         self._env = os.environ.copy()
         self._env["YDOTOOL_SOCKET"] = self.socket_path
 
         self._check_prerequisites()
 
     def _check_prerequisites(self) -> None:
-        """Проверяет доступность бинарников ydotool, wtype, wl-paste и сокета демона."""
-        # Проверка ydotool
         if not shutil.which("ydotool"):
-            logger.critical("Утилита ydotool не найдена в PATH!")
-            logger.critical("Установите её командой: sudo pacman -S ydotool")
+            logger.critical("Утилита ydotool не найдена в PATH! Установите: sudo pacman -S ydotool")
             sys.exit(1)
 
-        # Проверка сокета ydotoold
         if not os.path.exists(self.socket_path):
             logger.warning(f"Сокет демона {self.socket_path} не обнаружен.")
             logger.warning("Убедитесь, что служба запущена: sudo systemctl start ydotoold.service")
         else:
             logger.info(f"🔌 Сокет ydotool подключен: {self.socket_path}")
 
-        # Проверка wl-clipboard
         if not shutil.which("wl-paste"):
             logger.warning("Утилита wl-paste не найдена. Установите: sudo pacman -S wl-clipboard")
 
-        # Проверка wtype (критично для кириллицы в Wayland)
         if not shutil.which("wtype"):
             logger.warning("Утилита wtype не найдена. Для корректного ввода кириллицы установите: sudo pacman -S wtype")
 
     def activate_antigravity_window(self) -> bool:
-        """
-        Переключает фокус на окно Antigravity через hyprctl (Hyprland).
-        Окно определяется по классу: "class:antigravity".
-        """
         if not shutil.which("hyprctl"):
             return False
 
         try:
             result = subprocess.run(
-                ["hyprctl", "dispatch",
-                 'hl.dsp.focus({ window = "class:antigravity" })'],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
+                ["hyprctl", "dispatch", 'hl.dsp.focus({ window = "class:antigravity" })'],
+                capture_output=True, text=True, timeout=2.0,
             )
             if "ok" in result.stdout.lower():
                 logger.debug("Фокус переключён на окно Antigravity (hl.dsp.focus)")
                 return True
 
-            # Запасной вариант стандартного диспетчера Hyprland
             fallback = subprocess.run(
                 ["hyprctl", "dispatch", "focuswindow", "class:antigravity"],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
+                capture_output=True, text=True, timeout=2.0,
             )
             if "ok" in fallback.stdout.lower():
                 logger.debug("Фокус переключён на окно Antigravity (focuswindow)")
                 return True
 
-            logger.warning(f"Не удалось активировать окно: "
-                           f"{result.stdout.strip()} {result.stderr.strip()}")
+            logger.warning(f"Не удалось активировать окно: {result.stdout.strip()} {result.stderr.strip()}")
             return False
         except Exception as e:
             logger.warning(f"Ошибка активации окна: {e}")
             return False
 
     def _run_ydotool(self, *args: str) -> bool:
-        """Вызывает утилиту ydotool через subprocess с настроенным сокетом."""
         cmd = ["ydotool", *args]
         try:
-            res = subprocess.run(
-                cmd,
-                env=self._env,
-                capture_output=True,
-                text=True,
-                timeout=5.0
-            )
+            res = subprocess.run(cmd, env=self._env, capture_output=True, text=True, timeout=5.0)
             if res.returncode != 0:
                 err_msg = res.stderr.strip() or res.stdout.strip()
-                logger.error(f"ydotool вернул код ошибки {res.returncode}: {err_msg}")
+                logger.error(f"ydotool вернул ошибку {res.returncode}: {err_msg}")
                 return False
             return True
         except subprocess.TimeoutExpired:
@@ -484,10 +553,6 @@ class AntigravityController:
             return False
 
     def press_keys(self, keycodes: List[int], key_names: List[str]) -> None:
-        """
-        Нажимает последовательность клавиш по их Linux keycode.
-        Для каждой клавиши формируется пара <code:1> (нажатие) и <code:0> (отпускание).
-        """
         if not keycodes:
             return
 
@@ -509,7 +574,6 @@ class AntigravityController:
                 self.tts.speak("Нажато")
 
     def press_enter(self, speak: bool = True) -> None:
-        """Эмулирует нажатие клавиши Enter (KEY_ENTER = 28)."""
         logger.info("↵  \033[1mОтправка (Enter)\033[0m")
         self.activate_antigravity_window()
         time.sleep(0.2)
@@ -518,14 +582,8 @@ class AntigravityController:
             self.tts.speak("Отправлено")
 
     def read_clipboard(self) -> str:
-        """Считывает текстовое содержимое буфера обмена Wayland через wl-paste."""
         try:
-            res = subprocess.run(
-                ["wl-paste", "--no-newline"],
-                capture_output=True,
-                text=True,
-                timeout=2.0
-            )
+            res = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True, timeout=2.0)
             if res.returncode == 0:
                 return res.stdout
             return ""
@@ -537,10 +595,6 @@ class AntigravityController:
             return ""
 
     def paste_from_clipboard(self, and_send: bool = False) -> None:
-        """
-        Вставляет содержимое буфера обмена в активное окно Antigravity 2.0 (Ctrl+V).
-        Использует wtype (Wayland-native), если доступен, иначе fallback на ydotool.
-        """
         content = self.read_clipboard()
         if not content:
             logger.warning("📋 Буфер обмена пуст!")
@@ -552,12 +606,10 @@ class AntigravityController:
         preview_clean = preview.replace("\n", " ")
         logger.info(f"📋 Вставка из буфера ({len(content)} симв.): «\033[1m{preview_clean}\033[0m»")
 
-        # Активируем окно Antigravity
         self.activate_antigravity_window()
         time.sleep(0.3)
 
         success = False
-        # Способ 1: wtype Ctrl+V (основной надёжный метод для Electron GUI)
         if shutil.which("wtype"):
             try:
                 result = subprocess.run(
@@ -570,17 +622,13 @@ class AntigravityController:
             except Exception as e:
                 logger.debug(f"wtype ошибка: {e}")
 
-        # Способ 2: ydotool Ctrl+V (fallback)
         if not success:
-            # 29 = KEY_LEFTCTRL, 47 = KEY_V
             success = self._run_ydotool("key", "29:1", "47:1", "47:0", "29:0")
             if success:
                 logger.info("📥 Вставлено через ydotool (Ctrl+V)")
 
-        # Способ 3: Прямая печать содержимого буфера
         if not success:
             if shutil.which("wtype"):
-                logger.warning("Ctrl+V не сработал, печатаю содержимое через wtype")
                 try:
                     res = subprocess.run(["wtype", "--", content], capture_output=True, timeout=10.0)
                     if res.returncode == 0:
@@ -590,7 +638,6 @@ class AntigravityController:
                     logger.debug(f"wtype печать не удалась: {e}")
 
             if not success:
-                logger.warning("Печатаю содержимое через ydotool type")
                 success = self._run_ydotool("type", "-d", "5", "--", content)
                 if success:
                     logger.info("📥 Вставлено через ydotool type")
@@ -610,10 +657,6 @@ class AntigravityController:
                 self.tts.speak("Ошибка вставки")
 
     def type_text(self, text: str, and_send: bool = False) -> None:
-        """
-        Печатает распознанный текст через wtype (с поддержкой кириллицы)
-        с fallback на ydotool type и опционально нажимает Enter.
-        """
         if not text:
             logger.warning("Попытка ввода пустого текста.")
             return
@@ -639,7 +682,6 @@ class AntigravityController:
             except Exception as e:
                 logger.error(f"Ошибка wtype: {e}")
 
-        # Fallback на ydotool type, если wtype отсутствует или дал сбой
         if not success:
             logger.warning("Попытка ввода через ydotool type (fallback)")
             success = self._run_ydotool("type", "-d", "5", "--", text)
@@ -655,19 +697,7 @@ class AntigravityController:
                     self.tts.speak("Написано")
 
 
-# ---------------------------------------------------------------------------
-# 5. Парсер голосовых команд и соответствий
-# ---------------------------------------------------------------------------
 def parse_key_tokens(words: List[str]) -> Tuple[List[int], List[str], int]:
-    """
-    Разбирает список слов на последовательность клавиш.
-    Обрабатывает как сложные фразы ('стрелка вверх', 'ф один'),
-    так и простые слова ('один', 'два', 'три', 'энтер', 'пробел').
-    Возвращает:
-      - Список числовых кодов клавиш Linux
-      - Список названий клавиш для вывода и озвучки
-      - Количество успешно сопоставленных слов
-    """
     clean_words = [w for w in words if w not in FILLER_WORDS]
     codes: List[int] = []
     names: List[str] = []
@@ -676,7 +706,6 @@ def parse_key_tokens(words: List[str]) -> Tuple[List[int], List[str], int]:
     consumed = 0
 
     while i < n:
-        # Проверяем двухсловные сочетания
         if i + 1 < n:
             pair = (clean_words[i], clean_words[i + 1])
             if pair in MULTI_WORD_KEY_MAP:
@@ -687,7 +716,6 @@ def parse_key_tokens(words: List[str]) -> Tuple[List[int], List[str], int]:
                 consumed += 2
                 continue
 
-        # Проверяем однословные клавиши
         word = clean_words[i]
         if word in SINGLE_WORD_KEY_MAP:
             code, name = SINGLE_WORD_KEY_MAP[word]
@@ -697,39 +725,39 @@ def parse_key_tokens(words: List[str]) -> Tuple[List[int], List[str], int]:
             consumed += 1
             continue
 
-        # Неизвестное слово пропускается
         i += 1
 
     return codes, names, consumed
 
 
 def parse_voice_command(phrase: str) -> Tuple[str, ...]:
-    """
-    Классифицирует голосовую фразу пользователя в конкретную команду.
-    """
     clean = phrase.strip().lower()
     if not clean:
         return ("IGNORE",)
 
-    # 1. Завершение работы
     if clean in ["стоп", "выход", "завершить", "завершить работу", "закройся", "exit", "quit"]:
         return ("STOP",)
 
-    # 2. Вызов интерактивной справки
     if clean in ["справка", "помощь", "команды", "help"]:
         return ("HELP",)
 
-    # 3. Вставка из буфера (с отправкой или без)
+    if clean in ["статистика", "статы", "покажи статистику", "stats", "status"]:
+        return ("STATS",)
+
+    if clean in ["история", "покажи историю", "история команд", "лог", "history"]:
+        return ("HISTORY",)
+
+    if clean in ["смени голос", "поменяй голос", "переключи голос", "сменить голос", "другой голос"]:
+        return ("VOICE_CHANGE",)
+
     if any(clean.startswith(p) for p in ["вставь", "вставить", "вставка"]):
         if any(s in clean for s in ["отправ", "пошли", "запусти", "выполни"]):
             return ("PASTE_AND_SEND",)
         return ("PASTE",)
 
-    # 4. Просто отправка ("отправь")
     if any(clean == p or clean.startswith(p + " ") for p in ["отправь", "отправить", "выполни", "выполнить", "пошли", "послать"]):
         return ("SEND",)
 
-    # 5. Ввод текста: "напиши [текст]" или "напиши [текст] и отправь"
     TYPE_TRIGGERS = [
         "напиши ", "напишите ", "на пиши ", "на пишите ",
         "напечатай ", "напечатайте ", "на печатай ",
@@ -764,7 +792,6 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
                     return ("TYPE", body)
             break
 
-    # 6. Нажатие клавиш с префиксом ("нажми три", "нажми один два три")
     for prefix in ["нажми ", "нажать ", "жми ", "кликни ", "нажмите "]:
         if clean.startswith(prefix):
             body = clean[len(prefix):].strip()
@@ -772,14 +799,12 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
             if codes:
                 return ("KEYS", codes, names)
 
-    # 7. Прямой ввод клавиш без префикса (например: "энтер", "стрелка вверх")
     words = clean.split()
     codes, names, consumed = parse_key_tokens(words)
     meaningful_words = [w for w in words if w not in FILLER_WORDS]
     if codes and consumed > 0 and consumed == len(meaningful_words):
         return ("KEYS", codes, names)
 
-    # 8. Запасной разбор, если фраза начинается с глагола действия
     for verb in ["напиши", "напишите", "напечатай", "напечатайте", "введи", "введите", "набери", "наберите"]:
         if clean.startswith(verb):
             body = clean[len(verb):].strip(" ,:;-")
@@ -804,14 +829,10 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
     return ("UNKNOWN", clean)
 
 
-# ---------------------------------------------------------------------------
-# 6. Справка по командам
-# ---------------------------------------------------------------------------
 def print_help_table() -> None:
-    """Выводит подробную справочную таблицу по голосовым командам."""
     help_text = """
 =============================================================================
-              СПРАВОЧНИК ГОЛОСОВЫХ КОМАНД ANTIGRAVITY
+              СПРАВОЧНИК ГОЛОСОВЫХ КОМАНД ANTIGRAVITY (v0.3 Beta)
 =============================================================================
  Категория              | Пример фразы                  | Действие
 ------------------------+-------------------------------+--------------------
@@ -833,16 +854,19 @@ def print_help_table() -> None:
 ------------------------+-------------------------------+--------------------
  4. ОТПРАВКА            | "отправь"                     | Клавиша Enter
 ------------------------+-------------------------------+--------------------
- 5. СИСТЕМА             | "справка" / "помощь"          | Показать эту таблицу
+ 5. СИСТЕМА И НАСТРОЙКИ | "справка" / "помощь"          | Показать эту таблицу
+                        | "статистика"                  | Статистика сессии
+                        | "история"                     | Последние 10 команд
+                        | "смени голос"                 | Переключить голос (М/Ж)
                         | "стоп" / "выход"              | Завершить работу
+=============================================================================
+ ⚡ Управление: по умолчанию команды активны при удержании клавиши F9.
+    Флаг --always-on включает постоянное прослушивание без F9.
 =============================================================================
 """
     print(help_text)
 
 
-# ---------------------------------------------------------------------------
-# 7. Точка входа и главный цикл прослушивания
-# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Голосовое управление терминалом Antigravity через Vosk и ydotool"
@@ -865,6 +889,18 @@ def main():
         help="Отключить голосовые подтверждения синтезатора речи"
     )
     parser.add_argument(
+        "--voice",
+        type=str,
+        default="ru_female",
+        choices=["ru_female", "ru_male", "female", "male"],
+        help="Голос синтезатора речи Festival: ru_female (по умолчанию) или ru_male"
+    )
+    parser.add_argument(
+        "--always-on",
+        action="store_true",
+        help="Режим постоянного слушания (не требовать удержания клавиши F9)"
+    )
+    parser.add_argument(
         "--device",
         type=int,
         default=None,
@@ -873,13 +909,13 @@ def main():
     args = parser.parse_args()
 
     print("\n" + "=" * 60)
-    print(" 🚀 Antigravity Voice Controller v0.1v (Beta)")
+    print(" 🚀 Antigravity Voice Controller v0.3 (Beta)")
     print("=" * 60)
     print(" 🌐 Wayland / Hyprland / CachyOS")
     print(" 🎤 Vosk + 🔊 Festival + ⌨️  wtype / ydotool")
+    print(" ⚡ Push-to-Talk: " + ("ВЫКЛЮЧЕН (--always-on)" if args.always_on else "Клавиша F9"))
     print("=" * 60)
 
-    # Проверка зависимостей Python
     try:
         import sounddevice as sd
     except ImportError:
@@ -888,13 +924,11 @@ def main():
 
     try:
         from vosk import Model, KaldiRecognizer, SetLogLevel
-        # Отключаем отладочный вывод Kaldi в консоль
         SetLogLevel(-1)
     except ImportError:
         logger.critical("Модуль vosk не установлен! Установите: pip install vosk")
         sys.exit(1)
 
-    # Проверка каталога модели Vosk
     model_path = Path(args.model).resolve()
     if not model_path.exists():
         logger.critical(f"Модель Vosk не найдена по пути: {model_path}")
@@ -912,19 +946,18 @@ def main():
         logger.critical(f"Ошибка загрузки модели Vosk: {e}")
         sys.exit(1)
 
-    # Инициализация подсистем
-    tts = VoiceSynthesizer(enabled=not args.no_tts)
+    stats = SessionStats()
+    history = CommandHistory()
+    hotkey_mgr = HotkeyManager(key="f9", always_on=args.always_on)
+    tts = VoiceSynthesizer(enabled=not args.no_tts, voice=args.voice)
     controller = AntigravityController(socket_path=args.socket, tts=tts)
 
-    # Вывод справки по командам в консоль
     print_help_table()
     logger.info("🎙️ Инициализация аудиопотока микрофона (16 кГц, моно)...")
 
-    # Потокобезопасная очередь аудиосэмплов
     audio_queue: queue.Queue[bytes] = queue.Queue()
 
     def audio_callback(indata, frames, time_info, status):
-        """Callback-функция sounddevice для захвата аудио в реальном времени."""
         if status:
             logger.debug(f"Статус звукового потока: {status}")
         audio_queue.put(bytes(indata))
@@ -933,7 +966,6 @@ def main():
     is_running.set()
 
     def handle_sigint(signum, frame):
-        """Плавное завершение при нажатии Ctrl+C."""
         logger.info("\n🛑 Получен сигнал прерывания...")
         is_running.clear()
 
@@ -944,9 +976,8 @@ def main():
     recognizer = KaldiRecognizer(vosk_model, samplerate)
 
     tts.speak("Голосовое управление готово к работе")
-    logger.info("🟢 ГОТОВ К РАБОТЕ. Сделайте активным окно терминала Antigravity и произнесите команду...\n")
+    logger.info("🟢 ГОТОВ К РАБОТЕ. Произнесите команду...\n")
 
-    # Главный цикл захвата звука и обработки событий
     try:
         with sd.RawInputStream(
             samplerate=samplerate,
@@ -957,6 +988,8 @@ def main():
             callback=audio_callback
         ):
             while is_running.is_set():
+                hotkey_mgr.poll()
+
                 try:
                     data = audio_queue.get(timeout=0.2)
                 except queue.Empty:
@@ -979,50 +1012,91 @@ def main():
                     if not phrase:
                         continue
 
+                    stats.record_recognized()
+
+                    if not hotkey_mgr.is_active():
+                        logger.debug(f"🔇 [F9 не нажата, пропуск]: «{phrase}»")
+                        continue
+
                     logger.info(f"🗣️  Распознано: «\033[96m{phrase}\033[0m»")
 
                     cmd_data = parse_voice_command(phrase)
                     cmd_type = cmd_data[0]
+                    history.log(phrase, cmd_type)
 
                     if cmd_type == "PASTE_AND_SEND":
                         controller.paste_from_clipboard(and_send=True)
+                        stats.record_command()
 
                     elif cmd_type == "PASTE":
                         controller.paste_from_clipboard(and_send=False)
+                        stats.record_command()
 
                     elif cmd_type == "SEND":
                         controller.press_enter(speak=True)
+                        stats.record_command()
 
                     elif cmd_type == "TYPE_AND_SEND":
                         text_to_type = cmd_data[1]
                         controller.type_text(text_to_type, and_send=True)
+                        stats.record_command()
 
                     elif cmd_type == "TYPE":
                         text_to_type = cmd_data[1]
                         controller.type_text(text_to_type, and_send=False)
+                        stats.record_command()
 
                     elif cmd_type == "KEYS":
                         codes = cmd_data[1]
                         names = cmd_data[2]
                         controller.press_keys(codes, names)
+                        stats.record_command()
+
+                    elif cmd_type == "STATS":
+                        print(stats.get_summary())
+                        tts.speak(f"Выполнено {stats.stats['commands']} команд")
+                        stats.record_command()
+
+                    elif cmd_type == "HISTORY":
+                        recent_logs = history.get_recent(10)
+                        print("\n" + "=" * 55)
+                        print(" 📝 ПОСЛЕДНИЕ 10 КОМАНД (ИСТОРИЯ)")
+                        print("=" * 55)
+                        if recent_logs:
+                            for idx, item in enumerate(recent_logs, 1):
+                                print(f" {idx:2d}. {item}")
+                        else:
+                            print(" (История пока пуста)")
+                        print("=" * 55 + "\n")
+                        tts.speak("Показываю историю")
+                        stats.record_command()
+
+                    elif cmd_type == "VOICE_CHANGE":
+                        new_voice = tts.toggle_voice()
+                        stats.record_command()
 
                     elif cmd_type == "HELP":
                         print_help_table()
                         tts.speak("Вывожу справку")
+                        stats.record_command()
 
                     elif cmd_type == "STOP":
                         logger.info("Завершение работы по голосовой команде.")
+                        stats.record_command()
+                        print(stats.get_summary())
                         tts.speak("Завершение работы")
                         time.sleep(0.5)
                         is_running.clear()
                         break
 
                     elif cmd_type == "UNKNOWN":
+                        stats.record_error()
                         logger.warning(f"Команда не распознана: «{phrase}». Скажите 'справка' для списка команд.")
 
     except Exception as e:
         logger.critical(f"Критическая ошибка захвата звука: {e}")
     finally:
+        print(stats.get_summary())
         logger.info("👋 Остановка синтезатора речи и освобождение ресурсов...")
         tts.stop()
         logger.info("✅ Приложение успешно завершило работу.")
