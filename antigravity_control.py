@@ -99,7 +99,10 @@ class SessionStats:
         elapsed = max(1.0, time.time() - self.stats["start_time"])
         minutes = elapsed / 60.0
         cpm = self.stats["commands"] / minutes
-        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        hours = int(elapsed // 3600)
+        mins = int((elapsed % 3600) // 60)
+        secs = int(elapsed % 60)
+        elapsed_str = f"{hours:02d}:{mins:02d}:{secs:02d}"
         lines = [
             "\n" + "=" * 55,
             " 📊 СТАТИСТИКА СЕССИИ VOICEGRAVITY",
@@ -183,8 +186,10 @@ class HotkeyManager:
             import keyboard
             if keyboard.is_pressed(self.key):
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка опроса клавиши {self.key.upper()}: {e}. Активирован режим (--always-on).")
+            self.always_on = True
+            return True
         return (time.time() - self._last_pressed_time) < 1.5
 
 
@@ -347,7 +352,7 @@ class VoiceSynthesizer:
     def __init__(self, enabled: bool = True, port: int = 1314, voice: str = "ru_female"):
         self.enabled = enabled
         self.port = port
-        self.current_voice = "ru_female" if "fem" in voice.lower() or "жен" in voice.lower() else "ru_male"
+        self.current_voice = "ru_female" if ("fem" in voice.lower() or "жен" in voice.lower() or "irina" in voice.lower()) else "ru_male"
         self._queue = queue.Queue()
         self._server_process = None
         self._thread = None
@@ -432,7 +437,7 @@ class VoiceSynthesizer:
         return self._send_scheme(scheme)
 
     def set_voice(self, voice_type: str) -> str:
-        new_voice = "ru_female" if "fem" in voice_type.lower() or "жен" in voice_type.lower() else "ru_male"
+        new_voice = "ru_female" if ("fem" in voice_type.lower() or "жен" in voice_type.lower() or "irina" in voice_type.lower()) else "ru_male"
         self.current_voice = new_voice
         self._apply_voice_params(new_voice)
         return self.current_voice
@@ -738,16 +743,16 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
     if clean in ["стоп", "выход", "завершить", "завершить работу", "закройся", "exit", "quit"]:
         return ("STOP",)
 
-    if clean in ["справка", "помощь", "команды", "help"]:
+    if clean in ["справка", "справку", "помощь", "команды", "покажи команды", "покажи справку", "help"]:
         return ("HELP",)
 
-    if clean in ["статистика", "статы", "покажи статистику", "stats", "status"]:
+    if clean in ["статистика", "статистику", "статы", "покажи статистику", "показать статистику", "выведи статистику", "stats", "status"]:
         return ("STATS",)
 
-    if clean in ["история", "покажи историю", "история команд", "лог", "history"]:
+    if clean in ["история", "историю", "покажи историю", "показать историю", "выведи историю", "история команд", "лог", "history"]:
         return ("HISTORY",)
 
-    if clean in ["смени голос", "поменяй голос", "переключи голос", "сменить голос", "другой голос"]:
+    if clean in ["смени голос", "поменяй голос", "переключи голос", "сменить голос", "поменять голос", "переключить голос", "другой голос"]:
         return ("VOICE_CHANGE",)
 
     if any(clean.startswith(p) for p in ["вставь", "вставить", "вставка"]):
@@ -892,7 +897,7 @@ def main():
         "--voice",
         type=str,
         default="ru_female",
-        choices=["ru_female", "ru_male", "female", "male"],
+        choices=["ru_female", "ru_male", "female", "male", "irina", "pavel"],
         help="Голос синтезатора речи Festival: ru_female (по умолчанию) или ru_male"
     )
     parser.add_argument(
@@ -1053,9 +1058,9 @@ def main():
                         stats.record_command()
 
                     elif cmd_type == "STATS":
+                        stats.record_command()
                         print(stats.get_summary())
                         tts.speak(f"Выполнено {stats.stats['commands']} команд")
-                        stats.record_command()
 
                     elif cmd_type == "HISTORY":
                         recent_logs = history.get_recent(10)
@@ -1083,7 +1088,6 @@ def main():
                     elif cmd_type == "STOP":
                         logger.info("Завершение работы по голосовой команде.")
                         stats.record_command()
-                        print(stats.get_summary())
                         tts.speak("Завершение работы")
                         time.sleep(0.5)
                         is_running.clear()

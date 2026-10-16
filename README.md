@@ -6,11 +6,11 @@
 
 <p align="center">
   <strong>Голосовой контроллер для Antigravity 2.0.</strong><br>
-  Печатай, вставляй и управляй клавишами — голосом.
+  Печатай, вставляй и управляй клавишами - голосом.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2%20Beta-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-0.3%20Beta-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-green" alt="Platform"/>
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="License"/>
 </p>
@@ -19,13 +19,16 @@
 
 ## ✨ Возможности
 
-- 🎤 **Распознавание русской речи** — оффлайн, через Vosk
-- 🐧 **Linux** — CachyOS, Hyprland, Wayland
-- 🪟 **Windows** — Beta-версия
-- 🔊 **Синтез речи** — Festival (Linux) / pyttsx3 (Windows)
-- ⌨️ **Ввод текста** — через `wtype` (Linux) / `keyboard` (Windows)
-- 📋 **Вставка из буфера** — `wl-clipboard` (Linux) / `pyperclip` (Windows)
-- 🪟 **Автофокус на окно Antigravity** — через `hyprctl` (Linux) / `pygetwindow` (Windows)
+- 🎤 **Распознавание русской речи** - оффлайн, через Vosk
+- 🐧 **Linux** - CachyOS, Hyprland, Wayland
+- 🪟 **Windows** - Windows 10/11
+- 🔊 **Синтез речи** - Festival (Linux) / pyttsx3 (Windows), с возможностью смены голосов (женский / мужской)
+- ⌨️ **Ввод текста** - через `wtype` (Linux) / `keyboard` (Windows)
+- 📋 **Вставка из буфера** - `wl-clipboard` (Linux) / `pyperclip` (Windows)
+- 🪟 **Автофокус на окно Antigravity** - через `hyprctl` (Linux) / `pygetwindow` (Windows)
+- ⚡ **Push-to-Talk (PTT)** - активация распознавания по удержанию клавиши `F9` (или режим непрерывного прослушивания `--always-on`)
+- 📊 **Статистика сессии** - подсчёт распознанных фраз, команд, ошибок, времени работы и скорости (CPM)
+- 📝 **История команд** - запись истории действий в лог-файл `history.log`
 
 ---
 
@@ -44,7 +47,7 @@ sudo pacman -S python python-pip portaudio ydotool wtype wl-clipboard festival
 ```bash
 python -m venv ~/antigravity-env
 source ~/antigravity-env/bin/activate.fish
-pip install vosk sounddevice
+pip install vosk sounddevice keyboard
 ```
 
 **3. Модель Vosk (русский язык):**
@@ -59,7 +62,11 @@ unzip vosk-model-small-ru-0.22.zip
 **4. Запуск:**
 
 ```bash
+# Push-to-Talk режим (по умолчанию, активация по F9):
 python antigravity_control.py
+
+# Непрерывный режим прослушивания:
+python antigravity_control.py --always-on
 ```
 
 ---
@@ -79,7 +86,11 @@ pip install vosk sounddevice pyttsx3 pyperclip keyboard pygetwindow pywin32
 **3. Запуск:**
 
 ```powershell
+# Push-to-Talk режим (по умолчанию, активация по F9):
 python antigravity_control_windows.py
+
+# Непрерывный режим прослушивания:
+python antigravity_control_windows.py --always-on
 ```
 
 ---
@@ -93,9 +104,13 @@ python antigravity_control_windows.py
 | **Вставь** | Вставляет содержимое буфера обмена |
 | **Вставь и отправь** | Вставляет из буфера и нажимает Enter |
 | **Отправь** | Нажимает Enter |
+| **Нажми один / два / три** | Нажимает соответствующую цифру 1-9 (выбор варианта) |
 | **Нажми энтер** | Нажимает Enter |
 | **Нажми эскейп** | Нажимает Escape |
 | **Нажми таб** | Нажимает Tab |
+| **Статистика** | Показывает подробную статистику сессии (команды, CPM, время) |
+| **История** | Показывает последние 10 выполненных команд |
+| **Смени голос** | Переключает голос озвучки (женский / мужской) |
 | **Справка** | Показывает список команд |
 | **Стоп** / **Выход** | Завершает работу |
 
@@ -104,8 +119,8 @@ python antigravity_control_windows.py
 ## 🛠️ Как это работает
 
 1. **Vosk** слушает микрофон и распознаёт русскую речь (оффлайн).
-2. **Парсер** определяет команду: печать, вставка, нажатие клавиши.
-3. **Контроллер** переключает фокус на окно Antigravity.
+2. **Парсер** определяет команду: печать, вставка, нажатие клавиши, справка, статистика.
+3. **Контроллер** переключает фокус на окно Antigravity 2.0.
 4. **wtype / keyboard** вводит текст, **ydotool / keyboard** нажимает клавиши.
 5. **Festival / pyttsx3** озвучивает подтверждения.
 
@@ -113,22 +128,26 @@ python antigravity_control_windows.py
 
 ## 🚀 Версия
 
-**v0.2 (Beta)** — публичная бета-версия.
+**v0.3 (Beta)** - публичная бета-версия.
 
 - ✅ Работает на Linux (CachyOS, Hyprland)
-- ✅ Работает на Windows (Beta)
-- ⚠️ Возможны баги, присылайте отзывы
+- ✅ Работает на Windows (10/11)
+- ⚡ Поддержка Push-to-Talk (F9) и Continuous режима
+- 📊 Подсчёт статистики и история команд
+- 🔊 Переключение мужского и женского голосов
 
 ---
 
 ## 📄 Лицензия
 
-MIT License — используй, изменяй, распространяй свободно.
+MIT License - используй, изменяй, распространяй свободно.
 
 ---
 
-## 👤 Автор
+## 👤 Автор и репозиторий
 
 **VoiceGravity**
 
-Если проект полезен — поставь ⭐ на GitHub!
+Репозиторий проекта: [https://github.com/uuuugi/VoiceGravity](https://github.com/uuuugi/VoiceGravity)
+
+Если проект полезен - поставь ⭐ на [GitHub](https://github.com/uuuugi/VoiceGravity)!

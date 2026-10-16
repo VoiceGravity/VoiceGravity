@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-Голосовой контроллер Antigravity 2.0 v0.3 (Windows Beta)
+Голосовой контроллер Antigravity 2.0 v0.3 (Beta) для Windows 10/11
 =============================================================================
 Архитектура:
   - Распознавание речи: Vosk (оффлайн, русская модель vosk-model-small-ru-0.22)
@@ -102,7 +102,10 @@ class SessionStats:
         elapsed = max(1.0, time.time() - self.stats["start_time"])
         minutes = elapsed / 60.0
         cpm = self.stats["commands"] / minutes
-        elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        hours = int(elapsed // 3600)
+        mins = int((elapsed % 3600) // 60)
+        secs = int(elapsed % 60)
+        elapsed_str = f"{hours:02d}:{mins:02d}:{secs:02d}"
         lines = [
             "\n" + "=" * 55,
             " 📊 СТАТИСТИКА СЕССИИ VOICEGRAVITY (WINDOWS)",
@@ -203,8 +206,10 @@ class HotkeyManager:
             import keyboard
             if keyboard.is_pressed(self.key):
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка опроса клавиши {self.key.upper()}: {e}. Активирован режим (--always-on).")
+            self.always_on = True
+            return True
         return (time.time() - self._last_pressed_time) < 1.5
 
 
@@ -458,11 +463,17 @@ class VoiceSynthesizer:
         if self.enabled and text:
             self._queue.put(text)
 
+    def set_voice(self, voice_type: str) -> str:
+        """Устанавливает конкретный голос (ru_female или ru_male)."""
+        new_voice = "ru_female" if ("fem" in voice_type.lower() or "жен" in voice_type.lower() or "irina" in voice_type.lower()) else "ru_male"
+        self.current_voice = new_voice
+        self._queue.put(("__SET_VOICE__", new_voice))
+        return new_voice
+
     def toggle_voice(self) -> str:
         """Переключает голос между женским (Irina) и мужским (Pavel)."""
         new_voice = "ru_male" if self.current_voice == "ru_female" else "ru_female"
-        self.current_voice = new_voice
-        self._queue.put(("__SET_VOICE__", new_voice))
+        self.set_voice(new_voice)
         display_name = "мужской" if new_voice == "ru_male" else "женский"
         self.speak(f"Установлен {display_name} голос")
         return new_voice
@@ -720,19 +731,19 @@ def parse_voice_command(phrase: str) -> Tuple[str, ...]:
         return ("STOP",)
 
     # 2. Вызов интерактивной справки
-    if clean in ["справка", "помощь", "команды", "help"]:
+    if clean in ["справка", "справку", "помощь", "команды", "покажи команды", "покажи справку", "help"]:
         return ("HELP",)
 
     # 3. Статистика сессии
-    if clean in ["статистика", "статы", "покажи статистику", "stats", "status"]:
+    if clean in ["статистика", "статистику", "статы", "покажи статистику", "показать статистику", "выведи статистику", "stats", "status"]:
         return ("STATS",)
 
     # 4. История команд
-    if clean in ["история", "покажи историю", "история команд", "лог", "history"]:
+    if clean in ["история", "историю", "покажи историю", "показать историю", "выведи историю", "история команд", "лог", "history"]:
         return ("HISTORY",)
 
     # 5. Смена голоса
-    if clean in ["смени голос", "поменяй голос", "переключи голос", "сменить голос", "другой голос"]:
+    if clean in ["смени голос", "поменяй голос", "переключи голос", "сменить голос", "поменять голос", "переключить голос", "другой голос"]:
         return ("VOICE_CHANGE",)
 
     # 6. Вставка из буфера (с отправкой или без)
@@ -916,7 +927,7 @@ def main():
 
     # Вывод баннера Windows-версии
     print("\n" + "=" * 60)
-    print(" 🚀 Antigravity 2.0 Voice Controller v0.3 (Windows Beta)")
+    print(" 🚀 Antigravity 2.0 Voice Controller v0.3 (Beta)")
     print("=" * 60)
     print(" 🪟 Windows 10/11")
     print(" 🎤 Vosk + 🔊 pyttsx3 (SAPI5) + ⌨️  keyboard + 📋 pyperclip")
@@ -1078,9 +1089,9 @@ def main():
                         stats.record_command()
 
                     elif cmd_type == "STATS":
+                        stats.record_command()
                         print(stats.get_summary())
                         tts.speak(f"Выполнено {stats.stats['commands']} команд")
-                        stats.record_command()
 
                     elif cmd_type == "HISTORY":
                         recent_logs = history.get_recent(10)
@@ -1108,7 +1119,6 @@ def main():
                     elif cmd_type == "STOP":
                         logger.info("Завершение работы по голосовой команде.")
                         stats.record_command()
-                        print(stats.get_summary())
                         tts.speak("Завершение работы")
                         time.sleep(0.5)
                         is_running.clear()
