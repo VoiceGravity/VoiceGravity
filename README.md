@@ -5,15 +5,21 @@
 <h1 align="center">🎙️ VoiceGravity</h1>
 
 <p align="center">
-  <strong>Голосовой контроллер для Antigravity 2.0.</strong><br>
+  <strong>Внешний голосовой контроллер для Antigravity 2.0.</strong><br>
   Печатай, вставляй и управляй клавишами - голосом.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3%20Beta-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-0.4%20Beta-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-green" alt="Platform"/>
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="License"/>
 </p>
+
+---
+
+> **Важно:** это **отдельный** проект от [uuuugi/VoiceGravity](https://github.com/uuuugi/VoiceGravity) (расширение для IDE).
+>
+> **VoiceGravity** (этот репозиторий) — **внешний** голосовой контроллер для **Antigravity 2.0** (GUI-приложение).
 
 ---
 
@@ -26,7 +32,7 @@
 - ⌨️ **Ввод текста** - через `wtype` (Linux) / `keyboard` (Windows)
 - 📋 **Вставка из буфера** - `wl-clipboard` (Linux) / `pyperclip` (Windows)
 - 🪟 **Автофокус на окно Antigravity** - через `hyprctl` (Linux) / `pygetwindow` (Windows)
-- ⚡ **Push-to-Talk (PTT)** - активация распознавания по удержанию клавиши `F9` (или режим непрерывного прослушивания `--always-on`)
+- ⚡ **Push-to-Talk (PTT)** - активация распознавания по удержанию клавиши `F9` (или режим `--always-on`)
 - 📊 **Статистика сессии** - подсчёт распознанных фраз, команд, ошибок, времени работы и скорости (CPM)
 - 📝 **История команд** - запись истории действий в лог-файл `history.log`
 
@@ -128,13 +134,14 @@ python antigravity_control_windows.py --always-on
 
 ## 🚀 Версия
 
-**v0.3 (Beta)** - публичная бета-версия.
+**v0.4 (Beta)** - публичная бета-версия с исправлениями после QA-аудита.
 
 - ✅ Работает на Linux (CachyOS, Hyprland)
 - ✅ Работает на Windows (10/11)
 - ⚡ Поддержка Push-to-Talk (F9) и Continuous режима
 - 📊 Подсчёт статистики и история команд
 - 🔊 Переключение мужского и женского голосов
+- 🐛 Исправлено 7 багов после QA-аудита
 
 ---
 
@@ -148,6 +155,6 @@ MIT License - используй, изменяй, распространяй с�
 
 **VoiceGravity**
 
-Репозиторий проекта: [https://github.com/uuuugi/VoiceGravity](https://github.com/uuuugi/VoiceGravity)
+Репозиторий проекта: [https://github.com/VoiceGravity/VoiceGravity](https://github.com/VoiceGravity/VoiceGravity)
 
-Если проект полезен - поставь ⭐ на [GitHub](https://github.com/uuuugi/VoiceGravity)!
+Если проект полезен - поставь ⭐ на [GitHub](https://github.com/VoiceGravity/VoiceGravity)!
